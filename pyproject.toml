@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "india-auto-trader"
+version = "0.1.0"
+description = "AI-powered automated trading system for NSE/BSE using Claude Code + Kotak Neo API"
+requires-python = ">=3.12"
+dependencies = [
+    # Kotak Neo API v2
+    "neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.1#egg=neo_api_client",
+    "pyotp>=2.9.0",
+    # MCP server (Claude Code integration)
+    "mcp[cli]>=1.0.0",
+    "fastmcp>=2.0.0",
+    # FastAPI backend
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "python-multipart>=0.0.12",
+    # Data collection
+    "yfinance>=0.2.50",
+    "nsepython>=2.9",
+    "tweepy>=4.14.0",
+    "finnhub-python>=2.4.19",
+    "vaderSentiment>=3.3.2",
+    "pandas>=2.2.0",
+    "numpy>=2.0.0",
+    "httpx>=0.28.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
+    # Config & validation
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-dotenv>=1.0.0",
+    # Monitoring & alerting
+    "redis>=5.2.0",
+    "rich>=13.9.0",
+    "python-telegram-bot>=21.6",
+    # Utilities
+    "schedule>=1.2.2",
+    "pytz>=2024.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_server", "data_collector", "config", "risk", "backend", "backtesting", "monitoring"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

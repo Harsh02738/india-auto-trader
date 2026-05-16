@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "kotak-neo": {
+      "command": "python",
+      "args": ["mcp_server/kotak_mcp.py"],
+      "cwd": "C:\\Users\\Harsh Shah\\OneDrive\\Desktop\\Claude-Coding\\india-auto-trader"
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Read(data/**)",
+      "Write(data/**)",
+      "Read(config/**)",
+      "Read(claude_prompts/**)"
+    ]
+  }
+}

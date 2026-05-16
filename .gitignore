@@ -1,0 +1,57 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.coverage
+htmlcov/
+
+# Data files (large, auto-generated — not committed)
+data/market/
+data/fundamentals/
+data/options/
+data/sentiment/
+data/news/
+data/signals/
+data/penny/
+data/earnings/
+data/eod/
+data/paper/
+data/trades/
+
+# Keep data directory structure
+!data/.gitkeep
+!data/portfolio/.gitkeep
+
+# SQLite DB
+*.db
+*.db-shm
+*.db-wal
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

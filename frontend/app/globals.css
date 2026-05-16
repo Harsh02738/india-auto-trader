@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: #0a0e17;
+  color: #e5e7eb;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track { background: #111827; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+
+/* Ticker animation */
+.ticker-track { display: flex; width: max-content; }
+.ticker-track.animate { animation: ticker 40s linear infinite; }
+
+@keyframes ticker {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+/* Table */
+.data-table { @apply w-full text-sm; }
+.data-table th { @apply text-subtle font-medium text-xs px-3 py-2 text-left border-b border-border; }
+.data-table td { @apply px-3 py-2 border-b border-border/50; }
+.data-table tr:hover td { @apply bg-white/5; }
