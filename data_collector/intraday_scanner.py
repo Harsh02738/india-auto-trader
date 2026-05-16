@@ -6,7 +6,8 @@ Each cycle:
   2. Every 15 min (3 cycles): refreshes RSS sentiment → data/sentiment/{SYM}_sent.json
   3. Scores each symbol (intraday technicals + daily EMA-200 + fundamentals + sentiment)
   4. Upserts signals to Supabase (live dashboard updates via Realtime)
-  5. Detects NEW signal crossings → sends Telegram alert
+  5. NEW signal → sends Telegram alert with [✅ Go / ❌ Skip] inline buttons
+  6. User taps "Go" → symbol is queued → next cycle executes via Kotak Neo
 
 Usage:
     python -m data_collector.intraday_scanner
@@ -23,10 +24,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import httpx
-
 from config.instruments import NIFTY_50, NIFTY_200
-from config.settings import settings
+from monitoring.telegram_bot import start_bot_thread, send_signal_alert, send_text, pop_approved
 
 logger = logging.getLogger(__name__)
 
@@ -93,19 +92,6 @@ def minutes_to_open() -> int:
     return max(0, int((target - t).total_seconds() // 60))
 
 
-def _telegram(text: str) -> None:
-    token = getattr(settings, "telegram_bot_token", None)
-    chat_id = getattr(settings, "telegram_chat_id", None)
-    if not token or not chat_id:
-        return
-    try:
-        httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception as exc:
-        logger.debug("Telegram failed: %s", exc)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -327,26 +313,58 @@ def run_scan_cycle(
 
 def _alert_new_signals(new_signals: list[dict]) -> None:
     for sig in new_signals:
-        emoji = "📈" if sig["action"] == "BUY" else "📉"
-        rr    = f"  R:R {sig['risk_reward']}" if sig["risk_reward"] else ""
-        sl    = f"  SL ₹{sig['stop_loss']}" if sig["stop_loss"] else ""
-        tg    = f"  Target ₹{sig['target']}" if sig["target"] else ""
-        msg = (
-            f"{emoji} <b>NEW SIGNAL: {sig['action']} {sig['symbol']}</b>\n"
-            f"Score: <code>{sig['composite_score']*100:.0f}/100</code>  [{sig['confidence']}]\n"
-            f"Entry ₹{sig['entry_price']}{sl}{tg}{rr}\n"
-            f"<i>{sig['reasoning']}</i>"
-        )
-        _telegram(msg)
+        send_signal_alert(sig)  # sends with [✅ Go / ❌ Skip] inline buttons
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+def _execute_approved(approved_syms: set[str], signals_by_sym: dict[str, dict]) -> None:
+    """Place Kotak Neo orders for symbols the user approved via Telegram."""
+    for sym in approved_syms:
+        sig = signals_by_sym.get(sym)
+        if not sig:
+            logger.warning("Approved trade %s but no signal found — skipping", sym)
+            continue
+        try:
+            # Kotak Neo execution (requires live credentials)
+            from mcp_server.kotak_mcp import place_order, place_stop_loss
+            result = place_order(
+                symbol=sym,
+                action=sig["action"],
+                qty=sig.get("quantity", 1),
+                price=sig["entry_price"] or 0,
+                order_type="L",
+                product="MIS",
+                tag="CLAUDE_TELEGRAM",
+            )
+            order_id = (result or {}).get("order_id", "")
+            if order_id and sig.get("stop_loss"):
+                sl_action = "SELL" if sig["action"] == "BUY" else "BUY"
+                place_stop_loss(sym, sl_action, sig.get("quantity", 1), sig["stop_loss"], "MIS")
+            send_text(
+                f"✅ <b>Executed: {sig['action']} {sym}</b>\n"
+                f"Order ID: <code>{order_id or 'pending'}</code>\n"
+                f"Entry ₹{sig['entry_price']}  SL ₹{sig.get('stop_loss', '—')}"
+            )
+            logger.info("Executed approved trade: %s %s order_id=%s", sig["action"], sym, order_id)
+        except Exception as exc:
+            logger.error("Execution failed for %s: %s", sym, exc)
+            send_text(
+                f"⚠️ <b>Execution failed: {sym}</b>\n"
+                f"Error: <code>{exc}</code>\n"
+                "Check Kotak Neo credentials and try manually."
+            )
+
+
 def main(symbols: list[str]) -> None:
     prev_actions:    dict[str, str] = {}
+    last_signals:    dict[str, dict] = {}   # sym → latest signal, for trade execution
     cycle            = 0
     morning_done     = False
     eod_sent         = False
+
+    # Start Telegram bot in background thread
+    start_bot_thread()
 
     logger.info("Intraday scanner started — %d symbols", len(symbols))
     logger.info("Market hours: %02d:%02d–%02d:%02d IST | scan every %d sec",
@@ -356,21 +374,29 @@ def main(symbols: list[str]) -> None:
         t = now_ist()
 
         # ── Morning one-time daily data collection ────────────────────────────
-        # Run 9:00–9:14 AM if not yet done today
         if not morning_done and (9, 0) <= (t.hour, t.minute) < MARKET_OPEN:
             _morning_daily_collect(symbols)
             morning_done = True
-            eod_sent = False  # reset for new day
+            eod_sent = False
 
         if is_market_open():
             cycle += 1
-            morning_done = True  # market already open, skip belated morning run
+            morning_done = True
+
+            # Check for user-approved trades BEFORE the scan so we have latest signals
+            approved = pop_approved()
+            if approved:
+                _execute_approved(approved, last_signals)
 
             new_sigs = run_scan_cycle(symbols, cycle, prev_actions)
+
+            # Keep latest signals in memory for execution lookup
+            for sig in new_sigs:
+                last_signals[sig["symbol"]] = sig
+
             if new_sigs:
                 _alert_new_signals(new_sigs)
 
-            # Sleep until next cycle (subtract time spent collecting)
             time.sleep(SCAN_INTERVAL)
 
         else:
@@ -378,19 +404,18 @@ def main(symbols: list[str]) -> None:
             if (t.hour, t.minute) >= MARKET_CLOSE and not eod_sent and cycle > 0:
                 buys  = sum(1 for a in prev_actions.values() if a == "BUY")
                 sells = sum(1 for a in prev_actions.values() if a == "SELL")
-                msg = (
+                send_text(
                     f"📊 <b>EOD Scan Summary — {t.strftime('%d %b %Y')}</b>\n"
                     f"Cycles run: <code>{cycle}</code>\n"
                     f"Final signals — BUY: <code>{buys}</code>  SELL: <code>{sells}</code>\n"
                     f"HOLD: <code>{len(symbols) - buys - sells}</code>"
                 )
-                _telegram(msg)
                 logger.info("EOD: %d cycles run. BUY=%d SELL=%d", cycle, buys, sells)
                 eod_sent = True
-                # Reset for next trading day
                 cycle = 0
                 morning_done = False
                 prev_actions.clear()
+                last_signals.clear()
 
             mins = minutes_to_open()
             if mins > 0:

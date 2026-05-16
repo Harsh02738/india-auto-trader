@@ -37,14 +37,14 @@ export default function DashboardPage() {
   const fiiData = (fii ?? {}) as any;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">Dashboard</h1>
-        <span className="text-xs text-subtle font-mono">NSE/BSE • {new Date().toLocaleTimeString("en-IN")}</span>
+        <span className="text-xs text-subtle font-mono hidden sm:inline">NSE/BSE • {new Date().toLocaleTimeString("en-IN")}</span>
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <StatCard
           label="Account Equity"
           value={fmtCr(snap.account_equity)}
@@ -83,32 +83,52 @@ export default function DashboardPage() {
           {topSigs.length === 0 ? (
             <p className="text-subtle text-sm text-center py-8">No signals — run /scan-watchlist</p>
           ) : (
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Symbol</th><th>Tier</th><th>Action</th>
-                  <th>Entry</th><th>Score</th><th>R:R</th>
-                </tr>
-              </thead>
-              <tbody>
-                {topSigs.map((s: any) => (
-                  <tr key={s.symbol}>
-                    <td className="font-mono font-medium">{s.symbol}</td>
-                    <td className="text-subtle text-xs">{s.tier}</td>
-                    <td>
-                      <span className={`px-2 py-0.5 rounded text-xs font-semibold ${signalBadge(s.action)}`}>
-                        {s.action}
-                      </span>
-                    </td>
-                    <td className="font-mono">₹{fmt(s.entry_price)}</td>
-                    <td className={`font-mono ${scoreColor(s.composite_score)}`}>
-                      {fmt(s.composite_score * 100, 0)}
-                    </td>
-                    <td className="text-subtle">{fmt(s.risk_reward)}</td>
-                  </tr>
+            <>
+              {/* Mobile cards */}
+              <div className="sm:hidden space-y-2">
+                {topSigs.slice(0, 5).map((s: any) => (
+                  <div key={s.symbol} className="flex items-center justify-between py-2 border-b border-border/50 last:border-0">
+                    <div>
+                      <span className="font-mono font-semibold text-sm">{s.symbol}</span>
+                      <span className={`ml-2 px-1.5 py-0.5 rounded text-xs font-bold ${signalBadge(s.action)}`}>{s.action}</span>
+                    </div>
+                    <div className="text-right">
+                      <p className={`font-mono text-sm font-bold ${scoreColor(s.composite_score)}`}>{fmt(s.composite_score * 100, 0)}</p>
+                      <p className="text-xs text-subtle">₹{fmt(s.entry_price)}</p>
+                    </div>
+                  </div>
                 ))}
-              </tbody>
-            </table>
+              </div>
+              {/* Desktop table */}
+              <div className="hidden sm:block overflow-x-auto">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Symbol</th><th>Tier</th><th>Action</th>
+                      <th>Entry</th><th>Score</th><th>R:R</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topSigs.map((s: any) => (
+                      <tr key={s.symbol}>
+                        <td className="font-mono font-medium">{s.symbol}</td>
+                        <td className="text-subtle text-xs">{s.tier}</td>
+                        <td>
+                          <span className={`px-2 py-0.5 rounded text-xs font-semibold ${signalBadge(s.action)}`}>
+                            {s.action}
+                          </span>
+                        </td>
+                        <td className="font-mono">₹{fmt(s.entry_price)}</td>
+                        <td className={`font-mono ${scoreColor(s.composite_score)}`}>
+                          {fmt(s.composite_score * 100, 0)}
+                        </td>
+                        <td className="text-subtle">{fmt(s.risk_reward)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
           )}
         </div>
 
