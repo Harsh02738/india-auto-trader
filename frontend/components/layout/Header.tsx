@@ -1,9 +1,11 @@
 "use client";
 
+import dynamic from "next/dynamic";
+import { Wifi, WifiOff } from "lucide-react";
 import { useRealtimeTrading } from "@/lib/ws";
 import { circuitColor } from "@/lib/utils";
-import { Wifi, WifiOff } from "lucide-react";
-import LiveTicker from "./LiveTicker";
+
+const LiveTicker = dynamic(() => import("./LiveTicker"), { ssr: false });
 
 export default function Header() {
   const { connected, latestSignals, snapshot } = useRealtimeTrading();
