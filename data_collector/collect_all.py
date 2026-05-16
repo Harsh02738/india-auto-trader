@@ -23,7 +23,7 @@ from data_collector.fundamental      import collect_fundamentals
 from data_collector.option_chain     import collect_option_chain, collect_market_pcr
 from data_collector.penny_stocks     import collect_penny_candidates
 from data_collector.earnings_calendar import collect_earnings_calendar, collect_historical_results
-from data_collector.twitter_sentiment import collect_sentiment
+from data_collector.social_sentiment  import collect_sentiment
 from data_collector.news_collector   import collect_news
 from data_collector.fii_dii          import collect_fii_dii
 
@@ -88,7 +88,7 @@ def collect_news_all(symbols: list[str]) -> None:
 
 
 def collect_sentiment_all(symbols: list[str]) -> None:
-    logger.info("── Twitter Sentiment ────────────────────────────")
+    logger.info("── Social Sentiment (StockTwits + Google News + ET) ──")
 
     def _collect(sym):
         return collect_sentiment(sym, SYMBOL_COMPANY.get(sym, ""))
@@ -140,7 +140,7 @@ def full_collection(fast: bool = False) -> None:
         # News (API-rate-limited — do fewer symbols if needed)
         collect_news_all(equity_syms[:50])
 
-        # Twitter (rate-limited — only for top 20 high-priority symbols)
+        # Social sentiment (StockTwits + free RSS — top 20 priority symbols)
         priority_symbols = [
             "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFOSYS", "SBIN",
             "HINDUNILVR", "ITC", "LT", "BAJFINANCE",
