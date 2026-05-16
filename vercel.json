@@ -3,8 +3,5 @@
   "outputDirectory": "frontend/.next",
   "framework": "nextjs",
   "installCommand": "cd frontend && npm install",
-  "devCommand": "cd frontend && npm run dev",
-  "env": {
-    "NEXT_PUBLIC_API_URL": "http://localhost:8000"
-  }
+  "devCommand": "cd frontend && npm run dev"
 }

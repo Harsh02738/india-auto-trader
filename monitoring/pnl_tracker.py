@@ -11,7 +11,7 @@ import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from backend.services.data_reader import get_portfolio_snapshot
+from supabase_client import db
 from monitoring.alerts import send_eod_report
 from risk.circuit_breaker import CircuitBreaker
 
@@ -21,16 +21,50 @@ EOD_DIR = Path("data/eod")
 EOD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-async def run_eod() -> None:
-    snap    = get_portfolio_snapshot() or {}
-    cb      = CircuitBreaker()
-    status  = cb.status_report()
+def _get_supabase_snapshot() -> dict:
+    """Fetch latest portfolio snapshot from Supabase."""
+    try:
+        result = (
+            db.table("portfolio_snapshots")
+            .select("*")
+            .order("snapshot_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else {}
+    except Exception as exc:
+        logger.warning("Could not fetch Supabase snapshot: %s", exc)
+        return {}
 
-    today   = str(date.today())
+
+def _get_today_trades() -> list[dict]:
+    """Fetch today's closed trades from Supabase."""
+    try:
+        today = str(date.today())
+        result = (
+            db.table("trades")
+            .select("*")
+            .eq("is_open", False)
+            .gte("executed_at", f"{today}T00:00:00+00:00")
+            .execute()
+        )
+        return result.data or []
+    except Exception as exc:
+        logger.warning("Could not fetch today's trades: %s", exc)
+        return []
+
+
+async def run_eod() -> None:
+    snap         = _get_supabase_snapshot()
+    today_trades = _get_today_trades()
+    cb           = CircuitBreaker()
+    status       = cb.status_report()
+
+    today        = str(date.today())
     daily_pnl    = snap.get("daily_pnl", 0.0)
-    total_pnl    = 0.0  # will read from DB in full implementation
-    total_trades = len(snap.get("today_trades", []))
-    win_trades   = sum(1 for t in snap.get("today_trades", []) if t.get("pnl", 0) > 0)
+    total_pnl    = sum(t.get("realized_pnl") or 0 for t in today_trades)
+    total_trades = len(today_trades)
+    win_trades   = sum(1 for t in today_trades if (t.get("realized_pnl") or 0) > 0)
     win_rate     = (win_trades / total_trades * 100) if total_trades > 0 else 0.0
     circuit      = status["state"]
 

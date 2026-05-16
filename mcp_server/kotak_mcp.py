@@ -14,11 +14,11 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import pyotp
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from supabase_client import record_trade, close_trade as sb_close_trade
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -198,6 +198,15 @@ def place_order(
     trigger_price: float = 0,
     tag: str = "CLAUDE_AUTO",
     exchange: str = "nse_cm",
+    # Trading context — Claude Code passes these for Supabase trade recording
+    tier: str = "EQUITY",
+    stop_loss: float = 0,
+    target: float = 0,
+    composite_score: float | None = None,
+    confidence: str | None = None,
+    reasoning: str | None = None,
+    close_order_id: str | None = None,
+    realized_pnl: float | None = None,
 ) -> dict:
     """
     Place an equity order on NSE/BSE.
@@ -206,11 +215,11 @@ def place_order(
     product: MIS (intraday, square off by 3:15 PM), CNC (delivery, multi-day)
     price: set to 0 for MKT orders
     trigger_price: required for SL/SL-M orders
+    close_order_id: pass the original order_id to close/square-off a trade (records exit in Supabase)
     Returns: order_id (nOrdNo) on success.
     """
     client = _get_client()
 
-    # Resolve trading symbol format
     trading_symbol = f"{symbol}-EQ" if exchange in ("nse_cm", "bse_cm") else symbol
 
     for attempt in range(3):
@@ -233,6 +242,35 @@ def place_order(
         )
         if "error" not in result:
             log.info("Order placed: %s %s %d @ %.2f [%s]", action, symbol, qty, price, result)
+            order_id = result.get("nOrdNo") or result.get("orderId") or result.get("order_id")
+            if close_order_id:
+                # Closing an existing position
+                try:
+                    sb_close_trade(close_order_id, price, realized_pnl or 0)
+                except Exception as exc:
+                    log.warning("Supabase close_trade failed: %s", exc)
+            elif order_id and action.upper() == "BUY":
+                # Opening a new long position
+                try:
+                    record_trade({
+                        "order_id": str(order_id),
+                        "symbol": symbol,
+                        "tier": tier,
+                        "action": action.upper(),
+                        "product": product,
+                        "qty": qty,
+                        "entry_price": price or None,
+                        "stop_loss": stop_loss or None,
+                        "target": target or None,
+                        "composite_score": composite_score,
+                        "confidence": confidence,
+                        "reasoning": reasoning,
+                        "order_type": order_type,
+                        "tag": tag,
+                        "is_open": True,
+                    })
+                except Exception as exc:
+                    log.warning("Supabase record_trade failed: %s", exc)
             return result
         if "429" in str(result.get("error", "")):
             time.sleep(2 ** attempt)
@@ -416,6 +454,12 @@ def place_fo_order(
     qty: int,
     price: float,
     order_type: str = "L",
+    # Trading context — Claude Code passes these for Supabase trade recording
+    composite_score: float | None = None,
+    confidence: str | None = None,
+    reasoning: str | None = None,
+    close_order_id: str | None = None,
+    realized_pnl: float | None = None,
 ) -> dict:
     """
     Place an F&O options order.
@@ -425,6 +469,7 @@ def place_fo_order(
     action: BUY (preferred — defined risk) or SELL (avoid — unlimited risk)
     qty: number of shares (lots × lot_size, e.g. NIFTY = 75 per lot)
     order_type: L (limit, preferred) or MKT
+    close_order_id: pass the original order_id to close/square-off an F&O position
     ALWAYS buy options, never sell naked options (unlimited loss risk).
     """
     client = _get_client()
@@ -463,6 +508,35 @@ def place_fo_order(
         )
         if "error" not in result:
             log.info("F&O order placed: %s %s %s %s @ %.2f", action, symbol, option_type, strike, price)
+            order_id = result.get("nOrdNo") or result.get("orderId") or result.get("order_id")
+            if close_order_id:
+                try:
+                    sb_close_trade(close_order_id, price, realized_pnl or 0)
+                except Exception as exc:
+                    log.warning("Supabase close_trade failed: %s", exc)
+            elif order_id and action.upper() == "BUY":
+                try:
+                    record_trade({
+                        "order_id": str(order_id),
+                        "symbol": symbol,
+                        "tier": "FNO",
+                        "action": "BUY",
+                        "product": "NRML",
+                        "qty": qty,
+                        "entry_price": price or None,
+                        "option_type": option_type,
+                        "strike": strike,
+                        "expiry": expiry,
+                        "premium_paid": price,
+                        "composite_score": composite_score,
+                        "confidence": confidence,
+                        "reasoning": reasoning,
+                        "order_type": order_type,
+                        "tag": "CLAUDE_FNO",
+                        "is_open": True,
+                    })
+                except Exception as exc:
+                    log.warning("Supabase record_trade failed: %s", exc)
             return result
         if "429" in str(result.get("error", "")):
             time.sleep(2 ** attempt)

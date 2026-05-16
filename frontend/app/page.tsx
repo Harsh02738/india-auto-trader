@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { fetchSnapshot, fetchSignals, fetchFiiDii, fetchPnlSummary } from "@/lib/api";
-import { useWebSocket } from "@/lib/ws";
+import { useRealtimeTrading } from "@/lib/ws";
 import { fmt, fmtCr, fmtPct, circuitColor, scoreColor, signalBadge } from "@/lib/utils";
 import { TrendingUp, TrendingDown, Shield, DollarSign, Activity, Zap } from "lucide-react";
 
@@ -25,16 +25,16 @@ function StatCard({
 }
 
 export default function DashboardPage() {
-  const { lastMessage } = useWebSocket();
+  const { snapshot: liveSnap, latestSignals: liveSigs } = useRealtimeTrading();
   const { data: snapshot } = useQuery({ queryKey: ["snapshot"], queryFn: fetchSnapshot, refetchInterval: 10_000 });
   const { data: signals }  = useQuery({ queryKey: ["signals"],  queryFn: fetchSignals,  refetchInterval: 30_000 });
   const { data: fii }      = useQuery({ queryKey: ["fii"],      queryFn: fetchFiiDii,   refetchInterval: 60_000 });
   const { data: pnl }      = useQuery({ queryKey: ["pnl"],      queryFn: fetchPnlSummary });
 
-  const snap    = lastMessage?.snapshot ?? snapshot ?? {};
-  const topSigs = (signals ?? []).slice(0, 8);
+  const snap    = (liveSnap ?? snapshot) as any ?? {};
+  const topSigs = (liveSigs.length > 0 ? liveSigs : (signals ?? [])).slice(0, 8);
   const circuitState = snap.circuit_state ?? "SAFE";
-  const fiiData = lastMessage?.fii_dii ?? fii ?? {};
+  const fiiData = (fii ?? {}) as any;
 
   return (
     <div className="space-y-6">

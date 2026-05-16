@@ -1,46 +1,67 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { supabase } from "@/lib/supabase";
+import type { Signal, Trade, PortfolioSnapshot } from "@/lib/supabase";
 
-export type WsMessage = {
-  type: string;
-  timestamp: string;
-  snapshot?: any;
-  top_signals?: any[];
-  pcr?: any;
-  fii_dii?: any;
+export type LiveState = {
+  connected: boolean;
+  latestSignals: Signal[];
+  latestTrades: Trade[];
+  snapshot: PortfolioSnapshot | null;
 };
 
-export function useWebSocket() {
-  const [lastMessage, setLastMessage] = useState<WsMessage | null>(null);
+export function useRealtimeTrading(): LiveState {
   const [connected, setConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
+  const [latestSignals, setLatestSignals] = useState<Signal[]>([]);
+  const [latestTrades, setLatestTrades]   = useState<Trade[]>([]);
+  const [snapshot, setSnapshot]           = useState<PortfolioSnapshot | null>(null);
 
   useEffect(() => {
-    const connect = () => {
-      const ws = new WebSocket("ws://localhost:8000/ws");
-      wsRef.current = ws;
+    // Subscribe to new signals
+    const signalChannel = supabase
+      .channel("signals-live")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "signals" },
+        (payload) => {
+          setLatestSignals(prev => [payload.new as Signal, ...prev].slice(0, 20));
+        }
+      )
+      .subscribe((status) => setConnected(status === "SUBSCRIBED"));
 
-      ws.onopen = () => setConnected(true);
-      ws.onclose = () => {
-        setConnected(false);
-        setTimeout(connect, 3000);
-      };
-      ws.onmessage = (e) => {
-        try {
-          setLastMessage(JSON.parse(e.data));
-        } catch {}
-      };
-    };
+    // Subscribe to trade inserts/updates (position changes)
+    const tradeChannel = supabase
+      .channel("trades-live")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "trades" },
+        (payload) => {
+          const updated = payload.new as Trade;
+          setLatestTrades(prev => {
+            const filtered = prev.filter(t => t.id !== updated.id);
+            return [updated, ...filtered].slice(0, 50);
+          });
+        }
+      )
+      .subscribe();
 
-    connect();
-    const ping = setInterval(() => wsRef.current?.send("ping"), 30_000);
+    // Subscribe to portfolio snapshot updates
+    const snapChannel = supabase
+      .channel("snapshot-live")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "portfolio_snapshots" },
+        (payload) => setSnapshot(payload.new as PortfolioSnapshot)
+      )
+      .subscribe();
 
     return () => {
-      clearInterval(ping);
-      wsRef.current?.close();
+      supabase.removeChannel(signalChannel);
+      supabase.removeChannel(tradeChannel);
+      supabase.removeChannel(snapChannel);
     };
   }, []);
 
-  return { lastMessage, connected };
+  return { connected, latestSignals, latestTrades, snapshot };
 }
