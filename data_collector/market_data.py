@@ -78,7 +78,8 @@ def _safe(val) -> float | None:
 
 # ── Main collector ─────────────────────────────────────────────────────────────
 
-def collect_ohlcv(symbol: str, period: str = "3mo", interval: str = "1d") -> dict:
+def collect_ohlcv(symbol: str, period: str = "3mo", interval: str = "1d",
+                  out_filename: str | None = None) -> dict:
     """
     Download OHLCV from yfinance, compute indicators, write JSON.
     Returns the payload dict.
@@ -86,6 +87,7 @@ def collect_ohlcv(symbol: str, period: str = "3mo", interval: str = "1d") -> dic
     symbol: NSE symbol (e.g. "RELIANCE")
     period: yfinance period string
     interval: yfinance interval string
+    out_filename: override the output filename (default: {symbol}_ohlcv.json)
     """
     ticker_symbol = f"{symbol}.NS"
     logger.info("Fetching %s (period=%s interval=%s)", ticker_symbol, period, interval)
@@ -204,7 +206,7 @@ def collect_ohlcv(symbol: str, period: str = "3mo", interval: str = "1d") -> dic
         "candles":   candles,
     }
 
-    out_path = DATA_DIR / f"{symbol}_ohlcv.json"
+    out_path = DATA_DIR / (out_filename or f"{symbol}_ohlcv.json")
     out_path.write_text(json.dumps(payload, indent=2))
     logger.info("Wrote %s (%d candles)", out_path, len(candles))
     return payload
@@ -215,9 +217,14 @@ def collect_intraday(symbol: str) -> dict:
     return collect_ohlcv(symbol, period="1d", interval="5m")
 
 
+def collect_intraday_5m(symbol: str) -> dict:
+    """Collect 5-min OHLCV for last 5 days. Writes {symbol}_intraday.json (separate from EOD file)."""
+    return collect_ohlcv(symbol, period="5d", interval="5m", out_filename=f"{symbol}_intraday.json")
+
+
 def collect_daily(symbol: str) -> dict:
-    """Collect daily OHLCV for 3 months (standard baseline)."""
-    return collect_ohlcv(symbol, period="3mo", interval="1d")
+    """Collect daily OHLCV for 1 year — needed for EMA-200 calculation."""
+    return collect_ohlcv(symbol, period="1y", interval="1d")
 
 
 def run(symbols: list[str]) -> dict[str, dict]:
