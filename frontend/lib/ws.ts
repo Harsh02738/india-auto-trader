@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
+import { supabase, supabaseConfigured } from "@/lib/supabase";
 import type { Signal, Trade, PortfolioSnapshot } from "@/lib/supabase";
 
 export type LiveState = {
@@ -18,6 +18,8 @@ export function useRealtimeTrading(): LiveState {
   const [snapshot, setSnapshot]           = useState<PortfolioSnapshot | null>(null);
 
   useEffect(() => {
+    if (!supabaseConfigured) return; // skip realtime if env vars not set
+
     // Subscribe to new signals
     const signalChannel = supabase
       .channel("signals-live")
