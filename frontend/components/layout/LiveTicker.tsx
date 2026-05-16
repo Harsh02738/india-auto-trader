@@ -4,9 +4,9 @@ import { cn } from "@/lib/utils";
 
 interface TickerItem {
   symbol: string;
-  action?: string;
-  composite_score?: number;
-  entry_price?: number;
+  action?: string | null;
+  composite_score?: number | null;
+  entry_price?: number | null;
 }
 
 export default function LiveTicker({ signals }: { signals: TickerItem[] }) {
