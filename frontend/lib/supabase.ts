@@ -1,7 +1,12 @@
 import { createClient } from "@supabase/supabase-js";
 
-const url     = process.env.NEXT_PUBLIC_SUPABASE_URL     ?? "https://placeholder.supabase.co";
-const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "placeholder";
+// Support both Vercel integration naming (SUPABASE_URL) and manual naming (NEXT_PUBLIC_SUPABASE_URL)
+const url     = process.env.NEXT_PUBLIC_SUPABASE_URL
+             ?? process.env.SUPABASE_URL
+             ?? "https://placeholder.supabase.co";
+const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+             ?? process.env.SUPABASE_ANON_KEY
+             ?? "placeholder";
 
 // Browser client (used by components for Realtime subscriptions)
 export const supabase = createClient(url, anonKey);
