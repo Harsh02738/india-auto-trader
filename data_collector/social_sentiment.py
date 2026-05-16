@@ -2,11 +2,12 @@
 Multi-source social sentiment collector — free, no paid API keys required.
 
 Sources:
-  1. StockTwits  — stock-specific social posts with explicit Bullish/Bearish tags (free, no auth)
-  2. Google News RSS  — news headlines for the stock (free, no key)
-  3. Economic Times RSS — Indian financial news headlines (free, no key)
+  1. Google News RSS      — news headlines, India edition (free, no key)
+  2. Moneycontrol RSS     — Indian market news (free, no key)
+  3. Business Standard RSS — Indian financial news (free, no key)
+  4. Economic Times RSS   — general markets feed filtered by symbol (free, no key)
 
-Output: data/sentiment/{SYMBOL}_sent.json  (same schema as before)
+Output: data/sentiment/{SYMBOL}_sent.json
 """
 
 import json
@@ -27,12 +28,11 @@ SENTIMENT_DIR.mkdir(parents=True, exist_ok=True)
 _vader = SentimentIntensityAnalyzer()
 _http  = httpx.Client(
     timeout=10,
-    headers={"User-Agent": "Mozilla/5.0 (compatible; IndiaAutoTrader/1.0)"},
+    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"},
     follow_redirects=True,
 )
 
-MAX_STOCKTWITS = 30
-MAX_NEWS_ITEMS  = 15
+MAX_NEWS_ITEMS = 15
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -46,7 +46,6 @@ def _classify(score: float) -> str:
     return "NEUTRAL"
 
 def _parse_rss(xml_text: str) -> list[str]:
-    """Extract <title> strings from RSS XML using stdlib — no extra dependency."""
     titles: list[str] = []
     try:
         root = ET.fromstring(xml_text)
@@ -58,84 +57,86 @@ def _parse_rss(xml_text: str) -> list[str]:
         pass
     return titles
 
-
-# ── source 1: StockTwits ──────────────────────────────────────────────────────
-
-def _stocktwits(symbol: str) -> list[dict]:
-    """
-    Free public StockTwits stream — no auth needed.
-    Tries NSE-suffixed symbol first (e.g. RELIANCE.NSE), then bare symbol.
-    Also reads explicit Bullish/Bearish tags users attach to their posts.
-    """
-    for sym_fmt in [f"{symbol}.NSE", symbol]:
-        try:
-            r = _http.get(
-                f"https://api.stocktwits.com/api/2/streams/symbol/{sym_fmt}.json"
-            )
-            if r.status_code != 200:
-                continue
-            messages = r.json().get("messages", [])
-            items: list[dict] = []
-            for m in messages:
-                text  = m.get("body", "")
-                score = _score(text)
-                # Honour explicit user sentiment tag
-                explicit = (m.get("entities") or {}).get("sentiment") or {}
-                label    = explicit.get("basic", "")
-                if label == "Bullish":
-                    score = max(score, 0.25)
-                elif label == "Bearish":
-                    score = min(score, -0.25)
-                items.append({"text": text[:200], "score": score, "source": "stocktwits"})
-            if items:
-                logger.info("StockTwits: %d posts for %s", len(items), symbol)
-                return items[:MAX_STOCKTWITS]
-        except Exception as exc:
-            logger.debug("StockTwits error %s: %s", symbol, exc)
-    return []
-
-
-# ── source 2: Google News RSS ─────────────────────────────────────────────────
-
-def _google_news(symbol: str, company_name: str = "") -> list[dict]:
-    """Google News RSS — free, no API key, India edition."""
-    query = f"{company_name or symbol} NSE stock"
-    url   = (
-        f"https://news.google.com/rss/search"
-        f"?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
-    )
-    try:
-        r      = _http.get(url)
-        titles = _parse_rss(r.text)[:MAX_NEWS_ITEMS]
-        return [{"text": t, "score": _score(t), "source": "google_news"} for t in titles]
-    except Exception as exc:
-        logger.debug("Google News error %s: %s", symbol, exc)
-        return []
-
-
-# ── source 3: Economic Times RSS ─────────────────────────────────────────────
-
-def _economic_times(symbol: str) -> list[dict]:
-    """ET company news RSS — free, no key, very relevant for NSE stocks."""
-    url = f"https://economictimes.indiatimes.com/{symbol.lower()}/rssfeeds/news.cms"
+def _fetch_rss(url: str) -> list[str]:
     try:
         r = _http.get(url)
-        if r.status_code != 200:
-            return []
-        titles = _parse_rss(r.text)[:MAX_NEWS_ITEMS]
-        return [{"text": t, "score": _score(t), "source": "economic_times"} for t in titles]
+        if r.status_code == 200:
+            return _parse_rss(r.text)
     except Exception as exc:
-        logger.debug("ET RSS error %s: %s", symbol, exc)
-        return []
+        logger.debug("RSS fetch error %s: %s", url, exc)
+    return []
+
+def _filter_relevant(titles: list[str], symbol: str, company_name: str) -> list[str]:
+    """Keep only titles that mention the symbol or company name."""
+    keywords = {symbol.lower()}
+    if company_name:
+        # Add each word of the company name that's >3 chars
+        keywords.update(w.lower() for w in company_name.split() if len(w) > 3)
+    return [t for t in titles if any(k in t.lower() for k in keywords)]
+
+
+# ── source 1: Google News RSS ─────────────────────────────────────────────────
+
+def _google_news(symbol: str, company_name: str = "") -> list[dict]:
+    query = f"{company_name or symbol} NSE stock"
+    url   = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    titles = _fetch_rss(url)[:MAX_NEWS_ITEMS]
+    return [{"text": t, "score": _score(t), "source": "google_news"} for t in titles]
+
+
+# ── source 2: Moneycontrol RSS ────────────────────────────────────────────────
+
+_MC_FEEDS = [
+    "https://www.moneycontrol.com/rss/marketsnews.xml",
+    "https://www.moneycontrol.com/rss/business.xml",
+]
+
+def _moneycontrol(symbol: str, company_name: str = "") -> list[dict]:
+    items: list[dict] = []
+    for url in _MC_FEEDS:
+        titles = _filter_relevant(_fetch_rss(url), symbol, company_name)
+        items += [{"text": t, "score": _score(t), "source": "moneycontrol"} for t in titles]
+    return items[:MAX_NEWS_ITEMS]
+
+
+# ── source 3: LiveMint RSS ────────────────────────────────────────────────────
+
+_MINT_FEEDS = [
+    "https://www.livemint.com/rss/markets",
+    "https://www.livemint.com/rss/companies",
+]
+
+def _livemint(symbol: str, company_name: str = "") -> list[dict]:
+    items: list[dict] = []
+    for url in _MINT_FEEDS:
+        titles = _filter_relevant(_fetch_rss(url), symbol, company_name)
+        items += [{"text": t, "score": _score(t), "source": "livemint"} for t in titles]
+    return items[:MAX_NEWS_ITEMS]
+
+
+# ── source 4: Economic Times RSS ─────────────────────────────────────────────
+
+_ET_FEEDS = [
+    "https://economictimes.indiatimes.com/markets/stocks/news/rssfeeds/2146842.cms",
+    "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+]
+
+def _economic_times(symbol: str, company_name: str = "") -> list[dict]:
+    items: list[dict] = []
+    for url in _ET_FEEDS:
+        titles = _filter_relevant(_fetch_rss(url), symbol, company_name)
+        items += [{"text": t, "score": _score(t), "source": "economic_times"} for t in titles]
+    return items[:MAX_NEWS_ITEMS]
 
 
 # ── aggregate ─────────────────────────────────────────────────────────────────
 
 def collect_sentiment(symbol: str, company_name: str = "") -> dict:
     all_items: list[dict] = []
-    all_items += _stocktwits(symbol)
     all_items += _google_news(symbol, company_name)
-    all_items += _economic_times(symbol)
+    all_items += _moneycontrol(symbol, company_name)
+    all_items += _livemint(symbol, company_name)
+    all_items += _economic_times(symbol, company_name)
 
     scores = [i["score"] for i in all_items]
 
@@ -145,17 +146,17 @@ def collect_sentiment(symbol: str, company_name: str = "") -> dict:
         negative = sum(1 for s in scores if s < -0.05) / len(scores)
         neutral  = 1.0 - positive - negative
     else:
-        raw_avg = positive = negative = 0.0
-        neutral = 0.0
+        raw_avg = positive = negative = neutral = 0.0
 
-    sentiment_score = round((raw_avg + 1.0) / 2.0, 4)  # normalised 0–1, 0.5=neutral
+    sentiment_score = round((raw_avg + 1.0) / 2.0, 4)
 
     payload = {
         "symbol":          symbol,
         "timestamp":       datetime.now(tz=timezone.utc).isoformat(),
         "sources": {
-            "stocktwits":     sum(1 for i in all_items if i["source"] == "stocktwits"),
             "google_news":    sum(1 for i in all_items if i["source"] == "google_news"),
+            "moneycontrol":   sum(1 for i in all_items if i["source"] == "moneycontrol"),
+            "livemint":       sum(1 for i in all_items if i["source"] == "livemint"),
             "economic_times": sum(1 for i in all_items if i["source"] == "economic_times"),
         },
         "total_items":     len(all_items),
@@ -171,10 +172,11 @@ def collect_sentiment(symbol: str, company_name: str = "") -> dict:
     out = SENTIMENT_DIR / f"{symbol}_sent.json"
     out.write_text(json.dumps(payload, indent=2))
     logger.info(
-        "Sentiment %s | score=%.3f | items=%d (ST=%d GN=%d ET=%d)",
+        "Sentiment %s | score=%.3f | items=%d (GN=%d MC=%d LM=%d ET=%d)",
         symbol, sentiment_score, len(all_items),
-        payload["sources"]["stocktwits"],
         payload["sources"]["google_news"],
+        payload["sources"]["moneycontrol"],
+        payload["sources"]["livemint"],
         payload["sources"]["economic_times"],
     )
     return payload
