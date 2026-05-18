@@ -114,3 +114,73 @@ SWING_PROFILE = StrategyProfile(
     pre_earnings_size_pct=0.50,
     post_earnings_wait_bars=12,     # wait 1 hour post-results for swing
 )
+
+
+# ── Momentum strategy profile (multi-week trend following) ────────────────────
+MOMENTUM_PROFILE = StrategyProfile(
+    name="Momentum Trend",
+    mode="swing",
+    max_hold_days=20,               # hold trends up to 1 month
+    product_type="CNC",
+
+    min_composite_score=0.65,
+    min_rr_ratio=2.5,               # needs better R:R for trend following
+
+    atr_stop_multiplier=2.0,        # wider stop to survive pullbacks
+    atr_target_multiplier=5.0,      # big target — trend can run far
+    trailing_stop_atr_mult=2.0,     # trail loosely to stay in trend
+
+    risk_pct_per_trade=0.015,
+    max_position_pct=0.05,
+
+    require_ema200_above=True,
+    min_volume_ratio=1.0,           # momentum doesn't need volume spike
+    rsi_oversold_threshold=70.0,    # can buy higher RSI in strong trends
+    rsi_overbought_threshold=40.0,
+
+    avoid_first_minutes=30,
+    avoid_last_minutes=10,
+    trade_expiry_week=False,
+    trade_results_week=False,
+
+    max_sector_exposure_pct=0.30,
+    max_concurrent_positions=6,
+
+    pre_earnings_size_pct=0.50,
+    post_earnings_wait_bars=12,
+)
+
+
+# ── Mean reversion profile (short pullback plays) ─────────────────────────────
+MEAN_REVERSION_PROFILE = StrategyProfile(
+    name="Mean Reversion",
+    mode="intraday",
+    max_hold_days=3,                # quick bounce plays
+    product_type="MIS",
+
+    min_composite_score=0.60,
+    min_rr_ratio=1.5,
+
+    atr_stop_multiplier=1.5,
+    atr_target_multiplier=2.0,      # smaller target — bounce to mean
+    trailing_stop_atr_mult=1.0,
+
+    risk_pct_per_trade=0.02,
+    max_position_pct=0.05,
+
+    require_ema200_above=True,
+    min_volume_ratio=1.0,
+    rsi_oversold_threshold=50.0,    # RSI must be below 50 for mean reversion buys
+    rsi_overbought_threshold=35.0,
+
+    avoid_first_minutes=15,
+    avoid_last_minutes=20,
+    trade_expiry_week=False,
+    trade_results_week=False,
+
+    max_sector_exposure_pct=0.30,
+    max_concurrent_positions=5,
+
+    pre_earnings_size_pct=0.25,     # very small near earnings (mean reversion risky)
+    post_earnings_wait_bars=6,
+)

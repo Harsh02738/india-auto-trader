@@ -112,5 +112,11 @@ class Settings(BaseSettings):
     penny_target_pct_high: float = 0.50
     penny_volume_spike_threshold: float = 5.0   # operator activity flag
 
+    # ── Multi-strategy consensus engine ───────────────────────────────────────
+    strategy_min_votes: int = Field(default=2, ge=1, le=7)
+    strategy_min_consensus_confidence: float = Field(default=0.72, ge=0.50, le=0.95)
+    auto_scan_enabled: bool = True
+    trailing_stop_atr_mult: float = Field(default=1.5, ge=0.5, le=3.0)
+
 
 settings = Settings()

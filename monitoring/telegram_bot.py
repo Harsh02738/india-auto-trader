@@ -1,42 +1,68 @@
 """
-Telegram trade confirmation bot.
+Telegram Command Bot — full command + execution interface.
 
-Flow:
-  1. Scanner detects new BUY/SELL signal → calls send_signal_alert(signal)
-  2. Bot sends Telegram message with inline buttons [✅ Go  ❌ Skip]
-  3. User taps "Go" → approved_trades set is updated
-  4. Next scanner cycle picks up approved symbols → places Kotak Neo order
+Commands:
+  /analyze SYMBOL  (or just type a symbol / company name)
+  /positions       — open positions with P&L
+  /exit SYMBOL     — immediately exit a position
+  /status          — circuit breaker + daily P&L
+  /pnl             — today's P&L summary
+  /pause           — pause automated scanning
+  /resume          — resume automated scanning
+  /help            — list commands
 
-Run as a thread alongside intraday_scanner.py — do not run standalone.
+Execution Flow (for /analyze or free-text company lookup):
+  1. Bot fetches OHLCV + fundamentals
+  2. Runs StrategyEngine consensus evaluation
+  3. Sends rich result card with [Execute / Skip] buttons
+  4. On Execute tap: places real Kotak Neo order + SL, sends confirmation
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-APPROVED_TRADES_FILE = Path("data/approved_trades.json")
+PAUSE_FLAG = Path("data/portfolio/trading_paused.flag")
+SNAPSHOT_FILE = Path("data/portfolio/snapshot.json")
 
-# Thread-safe set of approved trade symbols
-_approved: set[str] = set()
-_lock = threading.Lock()
+# ── Shared state ───────────────────────────────────────────────────────────────
 _loop: asyncio.AbstractEventLoop | None = None
 _bot: Bot | None = None
+_app: Application | None = None
+_lock = threading.Lock()
+
+# Legacy signal-approval set (kept for backward compat with intraday_scanner)
+_approved: set[str] = set()
+
+# Pending execution signals stored by callback key → signal dict
+_pending_executions: dict[str, dict] = {}
 
 
-# ── Public API (called from scanner thread) ────────────────────────────────────
+# ── Legacy public API (backward compatibility) ─────────────────────────────────
 
 def pop_approved() -> set[str]:
-    """Return and clear all approved symbols. Called by scanner each cycle."""
+    """Return and clear all approved symbols. Called by legacy scanner."""
     with _lock:
         approved = set(_approved)
         _approved.clear()
@@ -44,29 +70,39 @@ def pop_approved() -> set[str]:
 
 
 def send_signal_alert(signal: dict) -> None:
-    """Send a Telegram signal with Go/Skip buttons. Called from scanner thread."""
+    """Send a legacy signal alert with Go/Skip buttons."""
     if not _loop or not _bot:
         return
-    asyncio.run_coroutine_threadsafe(_send_signal_coro(signal), _loop)
+    asyncio.run_coroutine_threadsafe(_send_legacy_alert(signal), _loop)
 
 
 def send_text(text: str) -> None:
-    """Send a plain text Telegram message. Called from scanner thread."""
+    """Send a plain text Telegram message."""
     if not _loop or not _bot:
         return
     asyncio.run_coroutine_threadsafe(_send_text_coro(text), _loop)
 
 
-# ── Async internals ────────────────────────────────────────────────────────────
+# ── Async send helpers ─────────────────────────────────────────────────────────
 
-async def _send_signal_coro(signal: dict) -> None:
-    chat_id = getattr(settings, "telegram_chat_id", None)
+async def _send_text_coro(text: str, parse_mode: str = "HTML") -> None:
+    chat_id = settings.telegram_chat_id
+    if not chat_id or not _bot:
+        return
+    try:
+        await _bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+    except Exception as exc:
+        logger.debug("Telegram send error: %s", exc)
+
+
+async def _send_legacy_alert(signal: dict) -> None:
+    chat_id = settings.telegram_chat_id
     if not chat_id or not _bot:
         return
 
     sym    = signal["symbol"]
     action = signal["action"]
-    score  = signal["composite_score"] * 100
+    score  = signal.get("composite_score", 0) * 100
     entry  = signal.get("entry_price")
     sl     = signal.get("stop_loss")
     tg     = signal.get("target")
@@ -88,7 +124,6 @@ async def _send_signal_coro(signal: dict) -> None:
         InlineKeyboardButton("✅ Go — Execute", callback_data=f"go|{sym}"),
         InlineKeyboardButton("❌ Skip",          callback_data=f"skip|{sym}"),
     ]])
-
     try:
         await _bot.send_message(
             chat_id=chat_id,
@@ -100,68 +135,610 @@ async def _send_signal_coro(signal: dict) -> None:
         logger.debug("Telegram send error: %s", exc)
 
 
-async def _send_text_coro(text: str) -> None:
-    chat_id = getattr(settings, "telegram_chat_id", None)
+# ── Analysis card sender (called by trade engine) ──────────────────────────────
+
+def send_analysis_card(consensus) -> None:
+    """Send a consensus analysis card with Execute/Skip buttons to Telegram."""
+    if not _loop or not _bot:
+        return
+    asyncio.run_coroutine_threadsafe(_send_analysis_card_coro(consensus), _loop)
+
+
+async def _send_analysis_card_coro(consensus) -> None:
+    """Format and send the rich analysis card."""
+    chat_id = settings.telegram_chat_id
     if not chat_id or not _bot:
         return
-    try:
-        await _bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-    except Exception as exc:
-        logger.debug("Telegram send error: %s", exc)
 
+    sym    = consensus.symbol
+    action = consensus.action
+    conf   = consensus.combined_confidence
+    votes  = consensus.vote_count
+    total  = consensus.total_strategies
+    entry  = consensus.entry
+    sl     = consensus.stop_loss
+    tg     = consensus.target
+    rr     = consensus.risk_reward
+
+    emoji = "📈" if action == "BUY" else "📉"
+
+    # Build strategy vote lines
+    vote_lines = []
+    for name, sig in consensus.individual_signals.items():
+        icon = "✅" if sig.action == action else ("❌" if sig.action == "HOLD" else "🔻")
+        vote_lines.append(f"  {icon} {name} ({sig.confidence:.2f})")
+
+    # Callback key encodes symbol + timestamp to avoid stale callbacks
+    ts_key = str(int(time.time()))
+    cb_exec = f"exec|{sym}|{ts_key}"
+    cb_skip = f"skip2|{sym}|{ts_key}"
+
+    # Store signal data for execution callback
+    with _lock:
+        _pending_executions[cb_exec] = {
+            "symbol": sym,
+            "action": action,
+            "entry":  entry,
+            "stop_loss": sl,
+            "target": tg,
+            "confidence": conf,
+            "reasoning": consensus.reasoning,
+        }
+
+    lines = [
+        f"{emoji} <b>{sym} — Score: {conf:.0%} | {votes}/{total} strategies agree</b>",
+        "",
+        "Strategy votes:",
+    ] + vote_lines + [
+        "",
+        f"Entry: ₹<code>{entry:.2f}</code>  |  SL: ₹<code>{sl:.2f}</code>  |  Target: ₹<code>{tg:.2f}</code>",
+        f"R:R = <code>{rr:.1f}</code>",
+        "",
+        f"<i>{consensus.reasoning[:200]}</i>",
+    ]
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Execute", callback_data=cb_exec),
+        InlineKeyboardButton("❌ Skip",    callback_data=cb_skip),
+    ]])
+
+    try:
+        await _bot.send_message(
+            chat_id=chat_id,
+            text="\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as exc:
+        logger.debug("Telegram card send error: %s", exc)
+
+
+# ── Command Handlers ───────────────────────────────────────────────────────────
+
+async def _cmd_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = [
+        "<b>India Auto-Trader Commands</b>",
+        "",
+        "/analyze SYMBOL — full strategy analysis",
+        "  <i>or just type a symbol: RELIANCE</i>",
+        "  <i>or company name: 'infosys'</i>",
+        "/positions — open positions + P&L",
+        "/exit SYMBOL — close a position now",
+        "/status — circuit breaker + daily P&L",
+        "/pnl — P&L summary",
+        "/pause — pause auto-scanning",
+        "/resume — resume auto-scanning",
+        "/help — this message",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def _cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = (context.args or [])
+    symbol_input = " ".join(args).strip().upper()
+    if not symbol_input:
+        await update.message.reply_text("Usage: /analyze SYMBOL  (e.g. /analyze RELIANCE)")
+        return
+    await _run_analysis(update, symbol_input)
+
+
+async def _cmd_positions(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("⏳ Fetching positions…")
+    try:
+        from broker.kotak_direct import KotakBroker
+        broker = KotakBroker()
+        positions = broker.get_positions()
+        if not positions:
+            await update.message.reply_text("No open positions.")
+            return
+
+        lines = ["<b>Open Positions</b>", ""]
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            sym = (pos.get("trdSym") or pos.get("symbol") or "?").replace("-EQ", "")
+            qty = pos.get("flBuyQty") or pos.get("netQty") or pos.get("quantity") or 0
+            avg = pos.get("avgPrice") or pos.get("average_price") or 0
+            ltp = pos.get("ltp") or pos.get("lastPrice") or 0
+            pnl = (float(ltp) - float(avg)) * int(qty) if avg and ltp else 0
+            sign = "+" if pnl >= 0 else ""
+            lines.append(f"<b>{sym}</b> qty={qty} avg=₹{avg} ltp=₹{ltp} P&L: {sign}₹{pnl:.0f}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as exc:
+        logger.error("positions error: %s", exc)
+        await update.message.reply_text(f"Error fetching positions: {exc}")
+
+
+async def _cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = (context.args or [])
+    if not args:
+        await update.message.reply_text("Usage: /exit SYMBOL")
+        return
+    symbol = args[0].upper()
+    await update.message.reply_text(f"⏳ Closing {symbol} at market…")
+    try:
+        from broker.kotak_direct import KotakBroker
+        broker = KotakBroker()
+        pos = broker.get_open_position(symbol)
+        if not pos:
+            await update.message.reply_text(f"No open position found for {symbol}.")
+            return
+        qty = int(pos.get("flBuyQty") or pos.get("netQty") or pos.get("quantity") or 0)
+        product = pos.get("product") or pos.get("prd") or "MIS"
+        result = broker.place_order(symbol, "SELL", abs(qty), 0, "MKT", product, tag="MANUAL_EXIT")
+        order_id = broker.extract_order_id(result)
+        if order_id:
+            await update.message.reply_text(f"✅ Exit order placed for {symbol} qty={abs(qty)}. Order ID: {order_id}")
+        else:
+            await update.message.reply_text(f"❌ Exit failed: {result.get('error', result)}")
+    except Exception as exc:
+        logger.error("exit error: %s", exc)
+        await update.message.reply_text(f"Error: {exc}")
+
+
+async def _cmd_status(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        snap = {}
+        if SNAPSHOT_FILE.exists():
+            snap = json.loads(SNAPSHOT_FILE.read_text())
+
+        cb = snap.get("circuit_breaker", {})
+        tripped = cb.get("tripped", False)
+        cb_state = "🚨 TRIPPED" if tripped else "✅ SAFE"
+        reason = cb.get("reason", "")
+        daily_pnl = snap.get("daily_pnl", 0)
+        consec = snap.get("consecutive_losses", 0)
+        paused = PAUSE_FLAG.exists()
+
+        sign = "+" if daily_pnl >= 0 else ""
+        lines = [
+            "<b>Trading Status</b>",
+            f"Circuit Breaker: {cb_state}",
+        ]
+        if reason:
+            lines.append(f"  Reason: {reason}")
+        lines += [
+            f"Daily P&L: {sign}₹{daily_pnl:,.0f}",
+            f"Consecutive losses: {consec}",
+            f"Auto-scan: {'⏸ PAUSED' if paused else '▶ ACTIVE'}",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as exc:
+        await update.message.reply_text(f"Error reading status: {exc}")
+
+
+async def _cmd_pnl(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        eod_path = Path(f"data/eod/{today}.json")
+        if eod_path.exists():
+            data = json.loads(eod_path.read_text())
+            pnl  = data.get("realized_pnl", 0)
+            trades = data.get("total_trades", 0)
+            wr   = data.get("win_rate", 0) * 100
+            sign = "+" if pnl >= 0 else ""
+            await update.message.reply_text(
+                f"<b>P&L — {today}</b>\nRealized: {sign}₹{pnl:,.0f}\n"
+                f"Trades: {trades}  Win rate: {wr:.0f}%",
+                parse_mode="HTML",
+            )
+        else:
+            snap = {}
+            if SNAPSHOT_FILE.exists():
+                snap = json.loads(SNAPSHOT_FILE.read_text())
+            pnl = snap.get("daily_pnl", 0)
+            sign = "+" if pnl >= 0 else ""
+            await update.message.reply_text(
+                f"<b>Running P&L — {today}</b>\n{sign}₹{pnl:,.0f} (intraday unrealized)",
+                parse_mode="HTML",
+            )
+    except Exception as exc:
+        await update.message.reply_text(f"P&L error: {exc}")
+
+
+async def _cmd_pause(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    PAUSE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+    PAUSE_FLAG.write_text(datetime.now(tz=timezone.utc).isoformat())
+    await update.message.reply_text("⏸ Automated scanning paused. Send /resume to restart.")
+
+
+async def _cmd_resume(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if PAUSE_FLAG.exists():
+        PAUSE_FLAG.unlink()
+        await update.message.reply_text("▶ Automated scanning resumed.")
+    else:
+        await update.message.reply_text("Scanning was not paused.")
+
+
+# ── Free-text message handler ──────────────────────────────────────────────────
+
+async def _handle_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Parse free text to extract a stock symbol and run analysis."""
+    text = (update.message.text or "").strip()
+    symbol = _resolve_symbol(text)
+    if symbol:
+        await _run_analysis(update, symbol)
+    else:
+        await update.message.reply_text(
+            f"Could not identify a stock symbol in '{text}'.\n"
+            "Try /analyze RELIANCE or just type: RELIANCE"
+        )
+
+
+# ── Analysis runner ────────────────────────────────────────────────────────────
+
+async def _run_analysis(update: Update, symbol: str) -> None:
+    """Fetch data, run strategy engine, send analysis card."""
+    await update.message.reply_text(f"⏳ Analysing <b>{symbol}</b>…", parse_mode="HTML")
+    try:
+        ohlcv, fundamentals = await asyncio.get_event_loop().run_in_executor(
+            None, _fetch_data, symbol
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Data fetch failed: {exc}")
+        return
+
+    if not ohlcv:
+        await update.message.reply_text(f"❌ No OHLCV data for {symbol}. Check the symbol.")
+        return
+
+    try:
+        from strategies.engine import StrategyEngine
+        engine = StrategyEngine()
+        consensus = engine.evaluate(symbol, ohlcv, fundamentals)
+    except Exception as exc:
+        logger.error("Strategy engine error for %s: %s", symbol, exc)
+        await update.message.reply_text(f"❌ Analysis error: {exc}")
+        return
+
+    await _send_analysis_card_coro(consensus)
+
+
+def _fetch_data(symbol: str) -> tuple[dict, dict | None]:
+    """Blocking: fetch OHLCV and fundamentals (called in executor)."""
+    from data_collector.market_data import collect_daily
+    from pathlib import Path
+    import json
+
+    ohlcv = {}
+    # Try cached file first to avoid rate limits
+    cache_path = Path(f"data/market/{symbol}_ohlcv.json")
+    if cache_path.exists():
+        try:
+            ohlcv = json.loads(cache_path.read_text())
+        except Exception:
+            pass
+
+    # Refresh from yfinance if stale or missing
+    if not ohlcv:
+        ohlcv = collect_daily(symbol)
+
+    fundamentals = None
+    fund_path = Path(f"data/fundamentals/{symbol}_fund.json")
+    if fund_path.exists():
+        try:
+            fundamentals = json.loads(fund_path.read_text())
+        except Exception:
+            pass
+
+    return ohlcv, fundamentals
+
+
+# ── Callback query handler ─────────────────────────────────────────────────────
 
 async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Go / Skip button presses."""
     query = update.callback_query
     await query.answer()
 
     data = query.data or ""
-    if "|" not in data:
-        return
+    parts = data.split("|")
+    action = parts[0]
 
-    action, sym = data.split("|", 1)
-    ts = datetime.now(tz=timezone.utc).strftime("%H:%M IST")
-
-    if action == "go":
+    # ── Legacy Go/Skip ────────────────────────────────────────────────────────
+    if action == "go" and len(parts) == 2:
+        sym = parts[1]
         with _lock:
             _approved.add(sym)
+        ts = datetime.now(tz=timezone.utc).strftime("%H:%M IST")
         await query.edit_message_text(
-            f"✅ <b>{sym} approved for execution</b>\nQueued at {ts} — will execute on next scan cycle.",
+            f"✅ <b>{sym} approved for execution</b>\nQueued at {ts}",
             parse_mode="HTML",
         )
         logger.info("Trade approved via Telegram: %s", sym)
-    elif action == "skip":
+        return
+
+    if action == "skip" and len(parts) == 2:
+        await query.edit_message_text(f"❌ <b>{parts[1]} skipped</b>", parse_mode="HTML")
+        return
+
+    # ── New Execute callback ──────────────────────────────────────────────────
+    if action == "exec" and len(parts) == 3:
+        cb_key = data
+        with _lock:
+            signal_data = _pending_executions.pop(cb_key, None)
+
+        if signal_data is None:
+            await query.edit_message_text("⚠️ Signal expired. Please re-run /analyze.")
+            return
+
+        symbol   = signal_data["symbol"]
+        trade_action = signal_data["action"]
+
         await query.edit_message_text(
-            f"❌ <b>{sym} skipped</b>",
+            f"⏳ Placing {trade_action} order for <b>{symbol}</b>…",
             parse_mode="HTML",
         )
-        logger.info("Trade skipped via Telegram: %s", sym)
+
+        result_msg = await asyncio.get_event_loop().run_in_executor(
+            None, _execute_trade, signal_data
+        )
+        await query.edit_message_text(result_msg, parse_mode="HTML")
+        return
+
+    # ── New Skip2 callback ────────────────────────────────────────────────────
+    if action == "skip2" and len(parts) == 3:
+        sym = parts[1]
+        with _lock:
+            _pending_executions.pop(data, None)
+        await query.edit_message_text(f"❌ <b>{sym} skipped</b>", parse_mode="HTML")
+        return
 
 
-# ── Bot thread ─────────────────────────────────────────────────────────────────
+# ── Trade execution (blocking, runs in executor) ───────────────────────────────
+
+def _execute_trade(signal: dict) -> str:
+    """
+    Blocking: validate, size, place order + SL. Returns a Telegram message string.
+    """
+    symbol       = signal["symbol"]
+    trade_action = signal["action"]
+    entry        = signal.get("entry", 0)
+    confidence   = signal.get("confidence", 0)
+    reasoning    = signal.get("reasoning", "")
+
+    try:
+        # Circuit breaker check
+        snap = {}
+        if SNAPSHOT_FILE.exists():
+            snap = json.loads(SNAPSHOT_FILE.read_text())
+        if snap.get("circuit_breaker", {}).get("tripped", False):
+            return "🚨 <b>Circuit breaker is TRIPPED — trade blocked.</b>\nUse /status for details."
+
+        from broker.kotak_direct import KotakBroker
+        from risk.position_sizer import PositionSizer
+        from data_collector.market_data import collect_daily
+        from supabase_client import record_trade
+        from monitoring.alerts import alert_trade_executed
+        import asyncio as _asyncio
+
+        broker = KotakBroker()
+        equity = broker.get_account_equity()
+
+        # Re-fetch live price to check for large moves since analysis
+        live_ltp = broker.get_ltp(symbol)
+        if live_ltp is None:
+            live_ltp = entry
+        price_drift = abs(live_ltp - entry) / max(entry, 1)
+        if price_drift > 0.01:
+            entry = live_ltp  # re-anchor to live price
+
+        # Get ATR for sizing
+        ohlcv = {}
+        cache = Path(f"data/market/{symbol}_ohlcv.json")
+        if cache.exists():
+            import json as _json
+            ohlcv = _json.loads(cache.read_text())
+        atr = ohlcv.get("atr") or entry * 0.02
+
+        sizer = PositionSizer(account_equity=equity)
+        sizing = sizer.equity(symbol, entry=entry, atr=atr)
+        qty = sizing.qty
+        stop_price = sizing.stop_loss_price
+        target_price = sizing.target_price
+
+        if qty < 1:
+            return f"❌ Position size too small (qty=0). Check account balance."
+
+        product = "MIS"  # default intraday; override for swing in settings
+
+        # Place entry order
+        order_result = broker.place_order(
+            symbol, trade_action, qty, round(entry, 2), "L", product, tag="TELEGRAM_EXEC"
+        )
+        order_id = broker.extract_order_id(order_result)
+        if not order_id:
+            return f"❌ Order failed: {order_result.get('error', order_result)}"
+
+        # Place stop-loss immediately after
+        sl_action = "SELL" if trade_action == "BUY" else "BUY"
+        sl_result = broker.place_stop_loss(symbol, sl_action, qty, stop_price, product)
+        sl_id = broker.extract_order_id(sl_result)
+
+        # Record trade in Supabase
+        try:
+            record_trade({
+                "order_id": order_id,
+                "symbol": symbol,
+                "tier": "EQUITY",
+                "action": trade_action,
+                "product": product,
+                "qty": qty,
+                "entry_price": round(entry, 2),
+                "stop_loss": stop_price,
+                "target": target_price,
+                "composite_score": round(confidence, 3),
+                "confidence": "HIGH" if confidence >= 0.70 else "MEDIUM",
+                "reasoning": reasoning[:500],
+                "order_type": "L",
+                "tag": "TELEGRAM_EXEC",
+                "is_open": True,
+                "sl_order_id": sl_id,
+            })
+        except Exception as exc:
+            logger.warning("Supabase record failed: %s", exc)
+
+        # Write signal file
+        _write_signal_file(symbol, trade_action, order_id, sl_id, entry, stop_price, target_price,
+                           qty, confidence, reasoning, ohlcv)
+
+        # Async Telegram alert
+        try:
+            _asyncio.run(alert_trade_executed(
+                symbol, trade_action, qty, entry, stop_price, target_price, confidence, "EQUITY"
+            ))
+        except Exception:
+            pass
+
+        rr = round((target_price - entry) / max(entry - stop_price, 0.01), 2)
+        sl_ok = f"✅ (ID: {sl_id})" if sl_id else "⚠️ SL placement failed"
+        return (
+            f"✅ <b>{trade_action} {symbol} executed!</b>\n"
+            f"Order ID: <code>{order_id}</code>\n"
+            f"Qty: {qty}  |  Entry: ₹{entry:.2f}\n"
+            f"SL: ₹{stop_price:.2f}  |  Target: ₹{target_price:.2f}\n"
+            f"R:R = {rr}  |  Risk = ₹{qty*(entry-stop_price):.0f}\n"
+            f"Stop-loss order: {sl_ok}"
+        )
+
+    except Exception as exc:
+        logger.error("Trade execution error for %s: %s", symbol, exc)
+        return f"❌ Execution error: {exc}"
+
+
+def _write_signal_file(
+    symbol, action, order_id, sl_id, entry, sl, target, qty, confidence, reasoning, ohlcv
+) -> None:
+    import json as _json
+    sig_dir = Path("data/signals")
+    sig_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "symbol": symbol,
+        "tier": "EQUITY",
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "action": action,
+        "entry_price": round(entry, 2),
+        "stop_loss": round(sl, 2),
+        "target": round(target, 2),
+        "quantity": qty,
+        "composite_score": round(confidence, 3),
+        "confidence": "HIGH" if confidence >= 0.70 else "MEDIUM",
+        "rsi": ohlcv.get("rsi"),
+        "above_ema200": ohlcv.get("above_ema200"),
+        "reasoning": reasoning[:500],
+        "executed": True,
+        "order_id": order_id,
+        "sl_order_id": sl_id,
+    }
+    (sig_dir / f"{symbol}_signal.json").write_text(_json.dumps(payload, indent=2))
+
+
+# ── Symbol resolution ─────────────────────────────────────────────────────────
+
+def _resolve_symbol(text: str) -> str | None:
+    """
+    Try to map free-text input to an NSE symbol.
+    Handles: "RELIANCE", "reliance", "analyze Infosys", "hdfc bank", etc.
+    """
+    from config.instruments import NIFTY_200
+
+    text_clean = text.strip().upper()
+
+    # Strip common prefixes
+    for prefix in ("ANALYZE ", "BUY ", "SELL ", "CHECK "):
+        if text_clean.startswith(prefix):
+            text_clean = text_clean[len(prefix):].strip()
+
+    # Direct symbol match (e.g., "RELIANCE", "TCS")
+    symbol_pattern = re.compile(r"^[A-Z&]{2,15}$")
+    if symbol_pattern.match(text_clean):
+        # Verify it's in our universe
+        symbols = {inst.symbol for inst in NIFTY_200}
+        if text_clean in symbols:
+            return text_clean
+        # Could still be valid even if not in Nifty200 — return as-is
+        if len(text_clean) >= 2:
+            return text_clean
+
+    # Fuzzy name match against NIFTY_200 company names
+    text_lower = text.lower()
+    best_sym = None
+    best_score = 0
+    for inst in NIFTY_200:
+        name_lower = inst.name.lower()
+        sym_lower  = inst.symbol.lower()
+        # Check if text is a substring of the name or vice versa
+        if text_lower in name_lower or sym_lower.startswith(text_lower):
+            score = len(text_lower)
+            if score > best_score:
+                best_score = score
+                best_sym = inst.symbol
+        elif name_lower.startswith(text_lower):
+            score = len(text_lower) + 5
+            if score > best_score:
+                best_score = score
+                best_sym = inst.symbol
+
+    return best_sym
+
+
+# ── Bot startup ────────────────────────────────────────────────────────────────
 
 async def _run_bot_async() -> None:
-    global _bot
+    global _bot, _app
 
-    token = getattr(settings, "telegram_bot_token", None)
+    token = settings.telegram_bot_token
     if not token:
         logger.warning("No TELEGRAM_BOT_TOKEN — Telegram bot disabled")
         return
 
-    app = (
-        Application.builder()
-        .token(token)
-        .build()
-    )
-    app.add_handler(CallbackQueryHandler(_handle_callback))
-    _bot = app.bot
+    app = Application.builder().token(token).build()
 
-    logger.info("Telegram bot starting (polling)...")
+    # Commands
+    app.add_handler(CommandHandler("help",     _cmd_help))
+    app.add_handler(CommandHandler("start",    _cmd_help))
+    app.add_handler(CommandHandler("analyze",  _cmd_analyze))
+    app.add_handler(CommandHandler("positions", _cmd_positions))
+    app.add_handler(CommandHandler("exit",     _cmd_exit))
+    app.add_handler(CommandHandler("status",   _cmd_status))
+    app.add_handler(CommandHandler("pnl",      _cmd_pnl))
+    app.add_handler(CommandHandler("pause",    _cmd_pause))
+    app.add_handler(CommandHandler("resume",   _cmd_resume))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(_handle_callback))
+
+    # Free text (non-command messages)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
+
+    _bot = app.bot
+    _app = app
+
+    logger.info("Telegram command bot starting…")
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["callback_query"])
+    await app.updater.start_polling(allowed_updates=["message", "callback_query"])
 
-    # Keep running until the event loop is stopped
     try:
         await asyncio.get_event_loop().create_future()
     except asyncio.CancelledError:
@@ -176,21 +753,21 @@ def start_bot_thread() -> bool:
     """Start the Telegram bot in a daemon thread. Returns True if started."""
     global _loop
 
-    token = getattr(settings, "telegram_bot_token", None)
+    token = settings.telegram_bot_token
     if not token:
         logger.info("Telegram bot skipped — no token configured")
         return False
 
     _loop = asyncio.new_event_loop()
 
-    def _thread_target():
+    def _target():
         asyncio.set_event_loop(_loop)
         try:
             _loop.run_until_complete(_run_bot_async())
         except Exception as exc:
-            logger.error("Telegram bot error: %s", exc)
+            logger.error("Telegram bot thread error: %s", exc)
 
-    thread = threading.Thread(target=_thread_target, daemon=True, name="telegram-bot")
+    thread = threading.Thread(target=_target, daemon=True, name="telegram-bot")
     thread.start()
     logger.info("Telegram bot thread started")
     return True
