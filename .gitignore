@@ -55,3 +55,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# TV bridge config has email credentials — never commit
+tv_bridge/config.toml
