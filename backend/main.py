@@ -74,36 +74,66 @@ async def health():
 #   {"symbol":"RELIANCE","action":"BUY","price":{{close}},"strategy":"MyPineScript"}
 # Set header X-TV-Secret to the value of TRADINGVIEW_WEBHOOK_SECRET in .env
 
-_TV_SECRET = os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")
+_TV_SECRET    = os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")
+_TV_BRIDGE_KEY = os.environ.get("TV_BRIDGE_API_KEY", "")
+
+
+def _webhook_auth_ok(x_tv_secret: str, x_api_key: str) -> bool:
+    """
+    Accept the request if at least one configured secret matches.
+    If no secrets are configured at all, allow everything (dev mode).
+    """
+    if not _TV_SECRET and not _TV_BRIDGE_KEY:
+        return True
+    if _TV_SECRET and x_tv_secret == _TV_SECRET:
+        return True
+    if _TV_BRIDGE_KEY and x_api_key == _TV_BRIDGE_KEY:
+        return True
+    return False
 
 
 @app.post("/webhook/tradingview")
 async def tradingview_webhook(
     request: Request,
     x_tv_secret: str = Header(default=""),
+    x_api_key: str = Header(default=""),
 ) -> dict:
     """
-    Receives Pine Script strategy alerts from TradingView.
-    Validates the secret token, runs the consensus engine on the signal,
-    and sends a Telegram HITL approval card if consensus passes.
+    Receives TradingView Pine Script alerts via two paths:
 
-    Pine Script alert message format (set in TradingView alert dialog):
-    {
-      "symbol": "RELIANCE",
-      "action": "BUY",
-      "price": {{close}},
-      "strategy": "MyPineScript",
-      "timeframe": "{{interval}}"
-    }
+    PATH A — Paid TV webhook (direct):
+      Header: X-TV-Secret: <TRADINGVIEW_WEBHOOK_SECRET>
+      Body:   {"symbol":"RELIANCE","action":"BUY","price":2500,"strategy":"MyScript","timeframe":"1D"}
+
+    PATH B — Free TV via TradingView-Free-Webhook-Alerts (email bridge):
+      Header: X-API-KEY: <TV_BRIDGE_API_KEY>
+      Body (IMAP/traditional mode):  same JSON as PATH A  (alert message is emailed verbatim)
+      Body (pipedream/ngrok mode):   {"content":"{...json...}","subject":"...","from":"..."}
+
+    Set your TradingView alert message text to:
+      {"symbol":"RELIANCE","action":"BUY","price":{{close}},"strategy":"MyScript","timeframe":"{{interval}}"}
     """
-    # Validate secret
-    if _TV_SECRET and x_tv_secret != _TV_SECRET:
+    if not _webhook_auth_ok(x_tv_secret, x_api_key):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Pipedream/ngrok wrapper: {content, subject, from, receive_datetime}
+    # Extract and re-parse the nested alert JSON from the "content" field.
+    if "content" in body and "symbol" not in body:
+        import json as _json
+        raw_content = body.get("content", "")
+        try:
+            body = _json.loads(raw_content)
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail="Pipedream wrapper detected but 'content' is not valid JSON. "
+                       "Set your TradingView alert message to a JSON object.",
+            )
 
     symbol   = str(body.get("symbol", "")).upper().strip()
     action   = str(body.get("action", "")).upper().strip()
