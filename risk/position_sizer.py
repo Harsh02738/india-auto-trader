@@ -1,5 +1,7 @@
 """
 ATR-based position sizer for all three trading tiers.
+Integrates Kelly Criterion from TradingMathEngine when historical stats are available.
+Kelly fraction caps the ATR-derived size so we never over-bet beyond mathematical edge.
 """
 
 import math
@@ -23,6 +25,8 @@ class SizingResult:
     max_by_risk: int         # cap from risk_pct
     final_qty: int           # min of both caps (same as qty)
     risk_reward: float
+    kelly_applied: bool = False    # True if Kelly cap was tighter than ATR cap
+    kelly_fraction: float = 0.0   # half-Kelly fraction used (0 if not applied)
 
 
 class PositionSizer:
@@ -79,8 +83,14 @@ class PositionSizer:
         atr: float,
         atr_stop_mult: float = 1.5,
         atr_target_mult: float = 2.5,
+        strategy_name: str | None = None,
     ) -> SizingResult:
-        """Standard equity position (Tier 1)."""
+        """
+        Standard equity position (Tier 1).
+        If strategy_name is provided, applies Kelly cap from historical trade stats.
+        Kelly cap is only applied when it is TIGHTER than the ATR-derived size,
+        and only when ≥30 historical trades exist for the strategy.
+        """
         result = self._base(
             entry=entry,
             atr=atr,
@@ -89,12 +99,79 @@ class PositionSizer:
             max_risk_pct=settings.max_account_risk_pct,
             max_notional_pct=settings.max_single_stock_pct,
         )
+
+        # Apply Kelly cap if historical data available
+        kelly_fraction = 0.0
+        kelly_applied = False
+        if strategy_name:
+            kelly_fraction, kelly_applied, result = self._apply_kelly_cap(
+                result, entry, strategy_name
+            )
+
+        result.kelly_applied = kelly_applied
+        result.kelly_fraction = kelly_fraction
+
         logger.info(
-            "[EQUITY] %s qty=%d entry=%.2f SL=%.2f T=%.2f R:R=%.2f notional=%.0f",
+            "[EQUITY] %s qty=%d entry=%.2f SL=%.2f T=%.2f R:R=%.2f notional=%.0f%s",
             symbol, result.qty, entry, result.stop_loss_price, result.target_price,
             result.risk_reward, result.notional,
+            f" [Kelly={kelly_fraction:.2%}]" if kelly_applied else "",
         )
         return result
+
+    def _apply_kelly_cap(
+        self,
+        result: "SizingResult",
+        entry: float,
+        strategy_name: str,
+    ) -> tuple[float, bool, "SizingResult"]:
+        """
+        Query historical stats and cap position size at half-Kelly if tighter.
+        Returns (kelly_fraction, was_applied, updated_result).
+        """
+        try:
+            from risk.math_engine import TradingMathEngine
+            engine = TradingMathEngine()
+            stats = engine.get_strategy_statistics(strategy_name, days=90)
+
+            if stats.total_trades < 30 or stats.ev is None:
+                return 0.0, False, result
+
+            if not stats.ev.has_positive_edge:
+                logger.warning(
+                    "[Kelly] %s has NEGATIVE EV (%.4f) — capping to minimum size",
+                    strategy_name, stats.ev.expected_value,
+                )
+                # Minimum 1 share, no Kelly expansion
+                return stats.ev.half_kelly_fraction, False, result
+
+            kelly_frac = stats.ev.half_kelly_fraction
+            kelly_max_notional = self.account_equity * kelly_frac
+            kelly_max_qty = math.floor(kelly_max_notional / entry) if entry > 0 else result.qty
+
+            if kelly_max_qty < result.qty:
+                # Kelly is tighter — apply the cap
+                capped_qty = max(1, kelly_max_qty)
+                capped_notional = round(capped_qty * entry, 2)
+                new_result = SizingResult(
+                    qty=capped_qty,
+                    risk_amount=result.risk_amount,
+                    stop_loss_price=result.stop_loss_price,
+                    target_price=result.target_price,
+                    notional=capped_notional,
+                    notional_pct=round(capped_notional / self.account_equity, 4),
+                    max_by_notional=result.max_by_notional,
+                    max_by_risk=result.max_by_risk,
+                    final_qty=capped_qty,
+                    risk_reward=result.risk_reward,
+                )
+                return kelly_frac, True, new_result
+
+            return kelly_frac, False, result
+
+        except Exception as exc:
+            logger.debug("Kelly cap skipped: %s", exc)
+            return 0.0, False, result
 
     def penny(
         self,

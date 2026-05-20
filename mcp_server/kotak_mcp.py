@@ -583,5 +583,320 @@ def get_portfolio_snapshot() -> dict:
     }
 
 
+# ─── MEMORY ENGINEERING TOOLS ────────────────────────────────────────────────
+# These tools implement the "memory loop" from the agentic trading framework:
+# after each trade closes, outcomes are logged back to Supabase so the AI can
+# learn from its own historical decisions and compute live EV/Kelly/RoR stats.
+
+@mcp.tool()
+def log_trade_outcome(
+    trade_order_id: str,
+    symbol: str,
+    final_pnl_pct: float,
+    final_pnl_inr: float,
+    outcome: str,
+    strategy_votes: str,
+    entry_price: float,
+    exit_price: float,
+    stop_loss: float = 0,
+    target: float = 0,
+    vote_count: int = 0,
+    market_context: str = "",
+    lessons_text: str = "",
+    tradingview_action: str = "HOLD",
+    tradingview_score: float = 0.0,
+    hold_duration_hours: float = 0.0,
+    tier: str = "EQUITY",
+) -> dict:
+    """
+    Log a trade outcome to the trade_journal table after a position closes.
+    Called after every exit so the system builds a self-learning memory.
+
+    outcome: WIN / LOSS / BREAKEVEN
+    strategy_votes: comma-separated strategy names e.g. "MACD_RSI,VWAP,TradingView"
+    final_pnl_pct: percentage P&L as decimal e.g. 0.023 for +2.3%
+    market_context: brief note on market conditions at time of entry
+    lessons_text: what worked / what didn't (used for self-review)
+    """
+    try:
+        from supabase_client import db
+        from datetime import datetime, timezone
+
+        # Compute math stats at entry for reference
+        ev_at_entry = kelly_at_entry = ror_at_entry = None
+        ror_status = None
+        try:
+            from risk.math_engine import TradingMathEngine
+            engine = TradingMathEngine()
+            stats = engine.get_strategy_statistics(days=60)
+            if stats.ev:
+                ev_at_entry = stats.ev.expected_value
+                kelly_at_entry = stats.ev.half_kelly_fraction
+            if stats.ror:
+                ror_at_entry = stats.ror.risk_of_ruin
+                ror_status = stats.ror.status
+        except Exception:
+            pass
+
+        tv_matched = tradingview_action == ("BUY" if final_pnl_pct > 0 else "SELL") and tradingview_action != "HOLD"
+
+        payload = {
+            "trade_order_id":       trade_order_id,
+            "symbol":               symbol,
+            "tier":                 tier,
+            "strategy_votes":       strategy_votes,
+            "vote_count":           vote_count,
+            "tradingview_action":   tradingview_action,
+            "tradingview_score":    tradingview_score if tradingview_score else None,
+            "entry_price":          entry_price,
+            "stop_loss":            stop_loss or None,
+            "target":               target or None,
+            "exit_price":           exit_price,
+            "final_pnl_pct":        final_pnl_pct,
+            "final_pnl_inr":        final_pnl_inr,
+            "outcome":              outcome.upper(),
+            "hold_duration_hours":  hold_duration_hours or None,
+            "market_context":       market_context,
+            "lessons_text":         lessons_text,
+            "tv_matched_direction": tv_matched,
+            "ev_at_entry":          ev_at_entry,
+            "kelly_at_entry":       kelly_at_entry,
+            "ror_at_entry":         ror_at_entry,
+            "ror_status_at_entry":  ror_status,
+            "closed_at":            datetime.now(tz=timezone.utc).isoformat(),
+        }
+        result = db.table("trade_journal").insert(payload).execute()
+        log.info("Trade journal entry created: %s %s %s %.2f%%", symbol, outcome, strategy_votes, final_pnl_pct * 100)
+        return {"status": "ok", "journal_id": result.data[0].get("id") if result.data else None}
+    except Exception as exc:
+        log.error("log_trade_outcome failed: %s", exc)
+        return {"error": str(exc), "status": "failed"}
+
+
+@mcp.tool()
+def get_strategy_performance_stats(
+    strategy_name: str = "",
+    days: int = 90,
+) -> dict:
+    """
+    Query trade_journal for win rate, avg win/loss, EV, Kelly fraction, Risk of Ruin.
+    Use this before entering a trade to verify the strategy has a positive edge.
+
+    strategy_name: filter by strategy e.g. "MACD_RSI" or "" for all strategies
+    days: lookback period in days (default 90)
+
+    Returns: win_rate, avg_win, avg_loss, EV, half_kelly%, risk_of_ruin, status, warnings.
+    """
+    try:
+        from risk.math_engine import TradingMathEngine
+        engine = TradingMathEngine()
+        stats = engine.get_strategy_statistics(
+            strategy_name=strategy_name or None,
+            days=days,
+        )
+        verdict = engine.validate_strategy_edge(stats)
+
+        result = {
+            "strategy": strategy_name or "ALL",
+            "days_analyzed": days,
+            "total_trades": stats.total_trades,
+            "wins": stats.wins,
+            "losses": stats.losses,
+            "win_rate": f"{stats.win_rate:.1%}",
+            "data_source": stats.data_source,
+            **verdict,
+        }
+
+        if stats.ev:
+            result["expected_value_raw"] = stats.ev.expected_value
+            result["half_kelly_raw"] = stats.ev.half_kelly_fraction
+        if stats.ror:
+            result["risk_of_ruin_raw"] = stats.ror.risk_of_ruin
+            result["ror_status"] = stats.ror.status
+            result["ror_message"] = stats.ror.message
+
+        return result
+    except Exception as exc:
+        log.error("get_strategy_performance_stats failed: %s", exc)
+        return {"error": str(exc), "status": "failed"}
+
+
+@mcp.tool()
+def get_recent_trade_journal(limit: int = 20) -> list:
+    """
+    Return the last N trade journal entries for self-review.
+    Read this at the start of each session to learn from recent outcomes.
+    Each entry includes entry conditions, strategy votes, TV signal, and P&L outcome.
+    """
+    try:
+        from supabase_client import db
+        result = (
+            db.table("trade_journal")
+            .select("id,symbol,tier,strategy_votes,vote_count,outcome,final_pnl_pct,"
+                    "final_pnl_inr,entry_price,exit_price,tradingview_action,"
+                    "tradingview_score,tv_matched_direction,market_context,"
+                    "lessons_text,ev_at_entry,kelly_at_entry,ror_status_at_entry,"
+                    "hold_duration_hours,created_at,closed_at")
+            .order("closed_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = result.data or []
+        # Format pnl_pct as % string for readability
+        for r in rows:
+            pnl = r.get("final_pnl_pct")
+            if pnl is not None:
+                r["pnl_display"] = f"{float(pnl)*100:+.2f}%"
+        return rows
+    except Exception as exc:
+        log.error("get_recent_trade_journal failed: %s", exc)
+        return [{"error": str(exc)}]
+
+
+@mcp.tool()
+def get_math_position_size(
+    symbol: str,
+    entry_price: float,
+    stop_loss: float,
+    account_equity: float = 0,
+    strategy_name: str = "",
+) -> dict:
+    """
+    Compute optimal position size using Kelly Criterion + ATR-based sizing.
+    The result is the MINIMUM of: Kelly-based cap and ATR-based cap.
+    This prevents over-betting even when ATR gives a large position.
+
+    symbol: NSE symbol e.g. "RELIANCE"
+    entry_price: planned entry price
+    stop_loss: stop loss price
+    account_equity: total account value (fetched from snapshot if 0)
+    strategy_name: pass strategy name to pull Kelly from historical stats
+
+    Returns: recommended_qty, max_risk_inr, kelly_fraction, kelly_applied, reasoning.
+    """
+    try:
+        import math as _math
+        from pathlib import Path
+        import json
+
+        # Get account equity
+        if account_equity <= 0:
+            snap_path = Path(__file__).parent.parent / "data" / "portfolio" / "snapshot.json"
+            if snap_path.exists():
+                snap = json.loads(snap_path.read_text())
+                account_equity = snap.get("account_equity", 500_000)
+            else:
+                account_equity = 500_000
+
+        stop_dist = abs(entry_price - stop_loss)
+        if stop_dist <= 0:
+            return {"error": "stop_loss must differ from entry_price"}
+
+        # ATR-based size (2% account risk)
+        risk_amount = account_equity * 0.02
+        atr_qty = _math.floor(risk_amount / stop_dist)
+        max_by_notional = _math.floor((account_equity * 0.05) / entry_price)
+        atr_qty = max(1, min(atr_qty, max_by_notional))
+
+        # Kelly-based size
+        kelly_fraction = 0.0
+        kelly_applied = False
+        kelly_qty = atr_qty
+
+        if strategy_name:
+            try:
+                from risk.math_engine import TradingMathEngine
+                engine = TradingMathEngine()
+                stats = engine.get_strategy_statistics(strategy_name, days=90)
+                if stats.total_trades >= 30 and stats.ev and stats.ev.has_positive_edge:
+                    kelly_fraction = stats.ev.half_kelly_fraction
+                    kelly_max_notional = account_equity * kelly_fraction
+                    kelly_qty = max(1, _math.floor(kelly_max_notional / entry_price))
+                    if kelly_qty < atr_qty:
+                        kelly_applied = True
+            except Exception as ke:
+                log.debug("Kelly calc skipped: %s", ke)
+
+        final_qty = kelly_qty if kelly_applied else atr_qty
+        notional = round(final_qty * entry_price, 2)
+        risk_inr = round(final_qty * stop_dist, 2)
+
+        return {
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "stop_distance": round(stop_dist, 2),
+            "recommended_qty": final_qty,
+            "notional_value": notional,
+            "max_risk_inr": risk_inr,
+            "risk_pct_of_equity": round(risk_inr / account_equity, 4),
+            "kelly_fraction": round(kelly_fraction, 6),
+            "kelly_applied": kelly_applied,
+            "atr_qty_without_kelly": atr_qty,
+            "account_equity_used": account_equity,
+            "reasoning": (
+                f"Kelly({kelly_fraction:.2%}) cap applied — reduced from {atr_qty} to {final_qty} shares"
+                if kelly_applied else
+                f"ATR-based sizing: {final_qty} shares (Kelly not applied — "
+                + ("insufficient trade history" if not strategy_name else "Kelly not tighter than ATR")
+                + ")"
+            ),
+        }
+
+    except Exception as exc:
+        log.error("get_math_position_size failed: %s", exc)
+        return {"error": str(exc), "status": "failed"}
+
+
+@mcp.tool()
+def get_tradingview_analysis(symbol: str) -> dict:
+    """
+    Get TradingView multi-timeframe technical analysis for an NSE symbol.
+    Polls 5m, 15m, 1h, 4h, and 1D timeframes and returns a confluence verdict.
+    This supplements your own indicators — it does NOT execute trades.
+
+    symbol: NSE symbol e.g. "RELIANCE", "NIFTY", "SBIN"
+    Returns: confluence_action (BUY/HOLD/SELL), confluence_score, per-timeframe breakdown.
+    """
+    try:
+        from data_collector.tradingview_collector import TradingViewCollector
+        collector = TradingViewCollector()
+        analysis = collector.get_multi_timeframe_analysis(symbol)
+
+        result: dict = {
+            "symbol": symbol,
+            "confluence_action": analysis.confluence_action,
+            "confluence_score": analysis.confluence_score,
+            "bullish_timeframes": analysis.bullish_tf_count,
+            "bearish_timeframes": analysis.bearish_tf_count,
+            "neutral_timeframes": analysis.neutral_tf_count,
+        }
+
+        if analysis.error:
+            result["error"] = analysis.error
+
+        # Per-timeframe breakdown
+        timeframes_out = {}
+        for tf, tfr in analysis.timeframes.items():
+            timeframes_out[tf] = {
+                "action": tfr.action,
+                "recommendation": tfr.recommendation,
+                "confidence": tfr.confidence,
+                "rsi": tfr.rsi,
+                "macd_signal": tfr.macd_signal,
+                "bb_position": tfr.bb_position,
+                "ema_alignment": tfr.ema_alignment,
+                "buy_indicators": tfr.buy_count,
+                "sell_indicators": tfr.sell_count,
+            }
+        result["timeframes"] = timeframes_out
+
+        log.info("[TV] %s → %s (score=%.2f)", symbol, analysis.confluence_action, analysis.confluence_score)
+        return result
+    except Exception as exc:
+        log.error("get_tradingview_analysis failed: %s", exc)
+        return {"error": str(exc), "symbol": symbol}
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

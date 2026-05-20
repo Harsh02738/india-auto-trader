@@ -37,6 +37,8 @@ dependencies = [
     # Utilities
     "schedule>=1.2.2",
     "pytz>=2024.2",
+    # TradingView technical analysis (multi-timeframe signals for NSE symbols)
+    "tradingview-ta>=3.3.0",
 ]
 
 [project.optional-dependencies]

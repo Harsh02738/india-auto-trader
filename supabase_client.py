@@ -95,3 +95,32 @@ def get_latest_signals(limit: int = 20) -> list[dict]:
         .execute()
     )
     return result.data or []
+
+
+# ── Trade Journal (memory engineering) ────────────────────────────────────────
+
+def insert_journal_entry(entry: dict) -> dict:
+    """Insert a trade outcome into trade_journal for memory engineering."""
+    result = db.table("trade_journal").insert(entry).execute()
+    return result.data[0] if result.data else {}
+
+
+def get_journal_entries(
+    strategy_name: str | None = None,
+    days: int = 90,
+    limit: int = 100,
+) -> list[dict]:
+    """Fetch trade journal entries for EV/Kelly/RoR computation."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+    query = (
+        db.table("trade_journal")
+        .select("*")
+        .gte("created_at", cutoff)
+        .order("closed_at", desc=True)
+        .limit(limit)
+    )
+    if strategy_name:
+        query = query.ilike("strategy_votes", f"%{strategy_name}%")
+    result = query.execute()
+    return result.data or []

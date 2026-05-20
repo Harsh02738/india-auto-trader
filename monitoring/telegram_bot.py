@@ -185,11 +185,25 @@ async def _send_analysis_card_coro(consensus) -> None:
             "reasoning": consensus.reasoning,
         }
 
+    # TV confluence line (if available)
+    tv_action = getattr(consensus, "tv_action", "HOLD")
+    tv_score  = getattr(consensus, "tv_score", 0.0)
+    tv_matched = getattr(consensus, "tv_matched", False)
+    tv_line = ""
+    if tv_action != "HOLD" and tv_score > 0:
+        tv_icon = "✅" if tv_matched else "⚠️"
+        tv_line = f"{tv_icon} TradingView: {tv_action} ({tv_score:.0%} confluence)"
+
     lines = [
         f"{emoji} <b>{sym} — Score: {conf:.0%} | {votes}/{total} strategies agree</b>",
         "",
         "Strategy votes:",
-    ] + vote_lines + [
+    ] + vote_lines
+
+    if tv_line:
+        lines += ["", tv_line]
+
+    lines += [
         "",
         f"Entry: ₹<code>{entry:.2f}</code>  |  SL: ₹<code>{sl:.2f}</code>  |  Target: ₹<code>{tg:.2f}</code>",
         f"R:R = <code>{rr:.1f}</code>",
@@ -197,10 +211,16 @@ async def _send_analysis_card_coro(consensus) -> None:
         f"<i>{consensus.reasoning[:200]}</i>",
     ]
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Execute", callback_data=cb_exec),
-        InlineKeyboardButton("❌ Skip",    callback_data=cb_skip),
-    ]])
+    tv_chart_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Execute", callback_data=cb_exec),
+            InlineKeyboardButton("❌ Skip",    callback_data=cb_skip),
+        ],
+        [
+            InlineKeyboardButton("📊 TV Chart", url=tv_chart_url),
+        ],
+    ])
 
     try:
         await _bot.send_message(
@@ -219,13 +239,16 @@ async def _cmd_help(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
     lines = [
         "<b>India Auto-Trader Commands</b>",
         "",
-        "/analyze SYMBOL — full strategy analysis",
+        "/analyze SYMBOL — full strategy analysis + TV chart button",
         "  <i>or just type a symbol: RELIANCE</i>",
         "  <i>or company name: 'infosys'</i>",
         "/positions — open positions + P&L",
         "/exit SYMBOL — close a position now",
         "/status — circuit breaker + daily P&L",
         "/pnl — P&L summary",
+        "/morning — EV stats, Risk of Ruin, circuit state",
+        "/math [STRATEGY] — EV / Kelly / Risk of Ruin breakdown",
+        "/journal — last 10 trade outcomes",
         "/pause — pause auto-scanning",
         "/resume — resume auto-scanning",
         "/help — this message",
@@ -355,6 +378,138 @@ async def _cmd_pnl(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
             )
     except Exception as exc:
         await update.message.reply_text(f"P&L error: {exc}")
+
+
+async def _cmd_morning(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Morning update: EV stats, Risk of Ruin, circuit state, TV watchlist top movers."""
+    await update.message.reply_text("⏳ Generating morning brief…")
+    try:
+        from risk.math_engine import TradingMathEngine
+        engine = TradingMathEngine()
+        stats = engine.get_strategy_statistics(days=90)
+
+        # Circuit state
+        snap = {}
+        if SNAPSHOT_FILE.exists():
+            snap = json.loads(SNAPSHOT_FILE.read_text())
+        cb = snap.get("circuit_breaker", {})
+        cb_state = "🚨 TRIPPED" if cb.get("tripped") else "✅ SAFE"
+        daily_pnl = snap.get("daily_pnl", 0)
+        consec = snap.get("consecutive_losses", 0)
+
+        lines = [
+            "<b>Morning Brief</b>",
+            "",
+            f"Circuit: {cb_state}  |  Daily P&L: ₹{daily_pnl:+,.0f}  |  Consec losses: {consec}",
+            "",
+            "<b>Strategy Math (last 90 days)</b>",
+        ]
+
+        if stats.total_trades == 0:
+            lines.append("No closed trades on record yet.")
+        else:
+            ev = stats.ev
+            ror = stats.ror
+            win_str = f"{stats.win_rate:.1%}" if stats.win_rate else "N/A"
+            ev_str = f"{ev.expected_value:+.4f}" if ev else "N/A"
+            kelly_str = f"{ev.half_kelly_fraction:.2%}" if ev else "N/A"
+            ror_str = f"{ror.risk_of_ruin:.2%}" if ror else "N/A"
+            ror_emoji = {"SAFE": "✅", "CAUTION": "⚠️", "DANGER": "🔴", "HALT": "🚨"}.get(
+                ror.status if ror else "", "❓"
+            )
+            lines += [
+                f"Trades: {stats.total_trades}  |  Win rate: {win_str}",
+                f"EV/trade: <code>{ev_str}</code>  |  Half-Kelly: <code>{kelly_str}</code>",
+                f"Risk of Ruin: <code>{ror_str}</code>  {ror_emoji}",
+            ]
+            if ev and ev.confidence_level != "SUFFICIENT":
+                lines.append(f"⚠️ {ev.confidence_level}: {stats.total_trades} trades (need 300+)")
+            if ror and ror.status in ("DANGER", "HALT"):
+                lines.append(f"🚨 {ror.message}")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as exc:
+        logger.error("morning error: %s", exc)
+        await update.message.reply_text(f"Morning brief error: {exc}")
+
+
+async def _cmd_math(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show EV/Kelly/RoR math for a strategy or overall portfolio."""
+    args = context.args or []
+    strategy = " ".join(args).strip() if args else ""
+    await update.message.reply_text(f"⏳ Computing math stats{' for ' + strategy if strategy else ''}…")
+    try:
+        from risk.math_engine import TradingMathEngine
+        engine = TradingMathEngine()
+        stats = engine.get_strategy_statistics(strategy_name=strategy or None, days=90)
+        verdict = engine.validate_strategy_edge(stats)
+
+        lines = [
+            f"<b>Trade Math — {strategy or 'ALL strategies'} (90d)</b>",
+            "",
+            f"Trades: {stats.total_trades}  |  Wins: {stats.wins}  |  Losses: {stats.losses}",
+        ]
+
+        if stats.ev:
+            ev = stats.ev
+            lines += [
+                f"Win rate: <code>{ev.win_rate:.1%}</code>",
+                f"Avg win:  <code>{ev.avg_win_pct:.2%}</code>  |  Avg loss: <code>{ev.avg_loss_pct:.2%}</code>",
+                f"EV/trade: <code>{ev.expected_value:+.4f}</code>  ({'POSITIVE' if ev.has_positive_edge else 'NEGATIVE'})",
+                f"Half-Kelly size: <code>{ev.half_kelly_fraction:.2%}</code>",
+                f"Break-even required after loss: <code>{ev.break_even_required:.2%}</code>",
+                f"Confidence: {ev.confidence_level} ({ev.sample_size} trades)",
+            ]
+            for w in ev.warnings:
+                lines.append(f"⚠️ {w}")
+
+        if stats.ror:
+            ror = stats.ror
+            ror_emoji = {"SAFE": "✅", "CAUTION": "⚠️", "DANGER": "🔴", "HALT": "🚨"}.get(ror.status, "❓")
+            lines += [
+                "",
+                f"Risk of Ruin: <code>{ror.risk_of_ruin:.2%}</code>  {ror_emoji}  [{ror.status}]",
+                f"Recommended size: <code>{ror.recommended_position_pct:.2%}</code> of capital",
+            ]
+
+        lines += ["", f"Verdict: <b>{verdict.get('verdict', 'N/A')}</b>"]
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as exc:
+        await update.message.reply_text(f"Math error: {exc}")
+
+
+async def _cmd_journal(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show last 10 trade journal entries."""
+    await update.message.reply_text("⏳ Fetching trade journal…")
+    try:
+        from supabase_client import db
+        result = (
+            db.table("trade_journal")
+            .select("symbol,outcome,final_pnl_pct,strategy_votes,tv_matched_direction,closed_at")
+            .order("closed_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            await update.message.reply_text("No journal entries yet. Log outcomes after each trade with log_trade_outcome().")
+            return
+
+        lines = ["<b>Recent Trade Journal (last 10)</b>", ""]
+        for r in rows:
+            outcome = r.get("outcome", "?")
+            pnl = float(r.get("final_pnl_pct", 0)) * 100
+            sym = r.get("symbol", "?")
+            tv_ok = "📺✅" if r.get("tv_matched_direction") else "📺❌"
+            strats = (r.get("strategy_votes", "") or "")[:30]
+            emoji = "✅" if outcome == "WIN" else ("❌" if outcome == "LOSS" else "➖")
+            lines.append(f"{emoji} <b>{sym}</b> {outcome}  {pnl:+.1f}%  {tv_ok}  <i>{strats}</i>")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    except Exception as exc:
+        await update.message.reply_text(f"Journal error: {exc}")
 
 
 async def _cmd_pause(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -715,15 +870,18 @@ async def _run_bot_async() -> None:
     app = Application.builder().token(token).build()
 
     # Commands
-    app.add_handler(CommandHandler("help",     _cmd_help))
-    app.add_handler(CommandHandler("start",    _cmd_help))
-    app.add_handler(CommandHandler("analyze",  _cmd_analyze))
+    app.add_handler(CommandHandler("help",      _cmd_help))
+    app.add_handler(CommandHandler("start",     _cmd_help))
+    app.add_handler(CommandHandler("analyze",   _cmd_analyze))
     app.add_handler(CommandHandler("positions", _cmd_positions))
-    app.add_handler(CommandHandler("exit",     _cmd_exit))
-    app.add_handler(CommandHandler("status",   _cmd_status))
-    app.add_handler(CommandHandler("pnl",      _cmd_pnl))
-    app.add_handler(CommandHandler("pause",    _cmd_pause))
-    app.add_handler(CommandHandler("resume",   _cmd_resume))
+    app.add_handler(CommandHandler("exit",      _cmd_exit))
+    app.add_handler(CommandHandler("status",    _cmd_status))
+    app.add_handler(CommandHandler("pnl",       _cmd_pnl))
+    app.add_handler(CommandHandler("pause",     _cmd_pause))
+    app.add_handler(CommandHandler("resume",    _cmd_resume))
+    app.add_handler(CommandHandler("morning",   _cmd_morning))
+    app.add_handler(CommandHandler("math",      _cmd_math))
+    app.add_handler(CommandHandler("journal",   _cmd_journal))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(_handle_callback))
