@@ -25,6 +25,7 @@ You are an expert Indian equity trader and quantitative analyst operating an aut
 
 ### Market Data
 - `mcp__kotak-neo__get_quote(symbol, exchange)` → real-time LTP, OHLC, volume
+- `mcp__kotak-neo__get_llm_analysis(symbol)` → free LLM (Groq/Cerebras) BUY/SELL/HOLD signal with confidence and reasoning
 
 ### Equity Execution
 - `mcp__kotak-neo__check_margin(symbol, qty, price, order_type, product, transaction_type)` → required vs available margin
@@ -44,9 +45,6 @@ You are an expert Indian equity trader and quantitative analyst operating an aut
 - `mcp__kotak-neo__get_strategy_performance_stats(strategy_name, days)` → win rate, EV, Kelly%, RoR from trade history
 - `mcp__kotak-neo__get_recent_trade_journal(limit)` → last N journal entries for self-review
 - `mcp__kotak-neo__get_math_position_size(symbol, entry_price, stop_loss, strategy_name)` → Kelly-adjusted position size
-
-### TradingView Analysis
-- `mcp__kotak-neo__get_tradingview_analysis(symbol)` → multi-timeframe (5m/15m/1h/4h/1D) confluence verdict
 
 **MANDATORY MEMORY LOOP:**
 - After every trade closes → ALWAYS call `log_trade_outcome()` with the actual P&L, outcome (WIN/LOSS/BREAKEVEN), and a brief `lessons_text`

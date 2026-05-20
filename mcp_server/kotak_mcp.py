@@ -849,52 +849,65 @@ def get_math_position_size(
 
 
 @mcp.tool()
-def get_tradingview_analysis(symbol: str) -> dict:
+def get_llm_analysis(symbol: str) -> dict:
     """
-    Get TradingView multi-timeframe technical analysis for an NSE symbol.
-    Polls 5m, 15m, 1h, 4h, and 1D timeframes and returns a confluence verdict.
+    Get a free LLM (Groq/Cerebras) trading signal for an NSE symbol.
+    Reads available OHLCV, fundamentals, sentiment, and news data files,
+    then queries the LLM for a BUY/SELL/HOLD verdict with confidence.
     This supplements your own indicators — it does NOT execute trades.
 
     symbol: NSE symbol e.g. "RELIANCE", "NIFTY", "SBIN"
-    Returns: confluence_action (BUY/HOLD/SELL), confluence_score, per-timeframe breakdown.
+    Returns: action (BUY/SELL/HOLD), confidence, reasoning.
     """
     try:
-        from data_collector.tradingview_collector import TradingViewCollector
-        collector = TradingViewCollector()
-        analysis = collector.get_multi_timeframe_analysis(symbol)
+        import json
+        from pathlib import Path
+        from llm_analyzer.analyzer import LLMAnalyzer
 
-        result: dict = {
+        ohlcv: dict = {}
+        ohlcv_path = Path(f"data/market/{symbol}_ohlcv.json")
+        if ohlcv_path.exists():
+            ohlcv = json.loads(ohlcv_path.read_text())
+
+        fundamentals: dict | None = None
+        fund_path = Path(f"data/fundamentals/{symbol}_fund.json")
+        if fund_path.exists():
+            fundamentals = json.loads(fund_path.read_text())
+
+        sentiment: dict | None = None
+        sent_path = Path(f"data/sentiment/{symbol}_sent.json")
+        if sent_path.exists():
+            sentiment = json.loads(sent_path.read_text())
+
+        news: list | None = None
+        news_path = Path(f"data/news/{symbol}_news.json")
+        if news_path.exists():
+            raw = json.loads(news_path.read_text())
+            news = raw if isinstance(raw, list) else raw.get("items", [])
+
+        if not ohlcv:
+            return {"error": "No OHLCV data available", "symbol": symbol}
+
+        analyzer = LLMAnalyzer()
+        signal = analyzer.analyze(symbol, ohlcv, fundamentals, sentiment, news)
+
+        if signal is None:
+            return {"error": "LLM unavailable (check GROQ_API_KEY / CEREBRAS_API_KEY)", "symbol": symbol}
+
+        result = {
             "symbol": symbol,
-            "confluence_action": analysis.confluence_action,
-            "confluence_score": analysis.confluence_score,
-            "bullish_timeframes": analysis.bullish_tf_count,
-            "bearish_timeframes": analysis.bearish_tf_count,
-            "neutral_timeframes": analysis.neutral_tf_count,
+            "action": signal.action,
+            "confidence": signal.confidence,
+            "reasoning": signal.reasoning,
+            "entry": signal.entry,
+            "stop_loss": signal.stop_loss,
+            "target": signal.target,
+            "risk_reward": signal.risk_reward,
         }
-
-        if analysis.error:
-            result["error"] = analysis.error
-
-        # Per-timeframe breakdown
-        timeframes_out = {}
-        for tf, tfr in analysis.timeframes.items():
-            timeframes_out[tf] = {
-                "action": tfr.action,
-                "recommendation": tfr.recommendation,
-                "confidence": tfr.confidence,
-                "rsi": tfr.rsi,
-                "macd_signal": tfr.macd_signal,
-                "bb_position": tfr.bb_position,
-                "ema_alignment": tfr.ema_alignment,
-                "buy_indicators": tfr.buy_count,
-                "sell_indicators": tfr.sell_count,
-            }
-        result["timeframes"] = timeframes_out
-
-        log.info("[TV] %s → %s (score=%.2f)", symbol, analysis.confluence_action, analysis.confluence_score)
+        log.info("[LLM] %s → %s (conf=%.2f)", symbol, signal.action, signal.confidence)
         return result
     except Exception as exc:
-        log.error("get_tradingview_analysis failed: %s", exc)
+        log.error("get_llm_analysis failed: %s", exc)
         return {"error": str(exc), "symbol": symbol}
 
 
