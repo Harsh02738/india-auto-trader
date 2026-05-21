@@ -21,7 +21,7 @@ _FAIL = "\033[91mFAIL\033[0m"
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
     status = _PASS if ok else _FAIL
-    print(f"  [{status}] {label}" + (f"  →  {detail}" if detail else ""))
+    print(f"  [{status}] {label}" + (f"  ->  {detail}" if detail else ""))
     return ok
 
 
@@ -39,7 +39,7 @@ def step0_config() -> bool:
     all_ok = True
     for name, val in required.items():
         ok = bool(val) and val not in PLACEHOLDERS
-        if not check(name, ok, val[:6] + "…" if ok else f"MISSING or placeholder: '{val}'"):
+        if not check(name, ok, val[:6] + "..." if ok else f"MISSING or placeholder: '{val}'"):
             all_ok = False
     return all_ok
 

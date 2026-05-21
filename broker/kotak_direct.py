@@ -52,13 +52,17 @@ class KotakBroker:
             environment=settings.kotak_environment,
         )
 
+        mobile = settings.kotak_mobile_number
+        if not mobile.startswith("+"):
+            mobile = "+91" + mobile
+
         totp = pyotp.TOTP(settings.kotak_totp_secret).now()
         client.totp_login(
-            mobile_number=settings.kotak_mobile_number,
-            UCC=settings.kotak_ucc,
-            TOTP=totp,
+            mobile_number=mobile,
+            ucc=settings.kotak_ucc,
+            totp=totp,
         )
-        client.totp_validate(MPIN=settings.kotak_mpin)
+        client.totp_validate(mpin=settings.kotak_mpin)
 
         self._client = client
         self._auth_ts = time.time()
@@ -135,7 +139,7 @@ class KotakBroker:
 
     def get_holdings(self) -> list:
         """Delivery holdings (T+2 settled)."""
-        result = self._call(self._get_client().holdings, "")
+        result = self._call(self._get_client().holdings)
         return result if isinstance(result, list) else result.get("data", [])
 
     def get_order_book(self) -> list:
