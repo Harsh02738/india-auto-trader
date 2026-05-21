@@ -12,7 +12,6 @@ class Settings(BaseSettings):
 
     # ── Kotak Neo ──────────────────────────────────────────────────────────────
     kotak_consumer_key: str = ""
-    kotak_consumer_secret: str = ""
     kotak_mobile_number: str = ""
     kotak_ucc: str = ""
     kotak_mpin: str = ""

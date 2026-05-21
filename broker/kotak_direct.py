@@ -49,17 +49,16 @@ class KotakBroker:
 
         client = NeoAPI(
             consumer_key=settings.kotak_consumer_key,
-            consumer_secret=settings.kotak_consumer_secret,
             environment=settings.kotak_environment,
-            on_message=lambda msg: logger.debug("WS tick: %s", msg),
-            on_error=lambda msg: logger.error("WS error: %s", msg),
-            on_open=lambda msg: logger.info("WS opened"),
-            on_close=lambda msg: logger.info("WS closed"),
         )
 
         totp = pyotp.TOTP(settings.kotak_totp_secret).now()
-        client.login(mobilenumber=settings.kotak_mobile_number, password=settings.kotak_mpin)
-        client.session_2fa(OTP=totp)
+        client.totp_login(
+            mobile_number=settings.kotak_mobile_number,
+            UCC=settings.kotak_ucc,
+            TOTP=totp,
+        )
+        client.totp_validate(MPIN=settings.kotak_mpin)
 
         self._client = client
         self._auth_ts = time.time()
