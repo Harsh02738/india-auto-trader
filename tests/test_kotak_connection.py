@@ -61,7 +61,7 @@ def step2_quote(broker) -> bool:
     print("\n[2] Quote fetch — RELIANCE")
     try:
         ltp = broker.get_ltp("RELIANCE", "nse_cm")
-        return check("get_ltp(RELIANCE)", ltp is not None, f"LTP = ₹{ltp}")
+        return check("get_ltp(RELIANCE)", ltp is not None, f"LTP = Rs.{ltp}")
     except Exception as exc:
         return check("get_ltp", False, str(exc))
 
@@ -70,7 +70,7 @@ def step3_equity(broker) -> bool:
     print("\n[3] Account equity")
     try:
         equity = broker.get_account_equity()
-        return check("get_account_equity()", equity > 0, f"₹{equity:,.0f}")
+        return check("get_account_equity()", equity > 0, f"Rs.{equity:,.0f}")
     except Exception as exc:
         return check("get_account_equity", False, str(exc))
 
@@ -95,7 +95,7 @@ def step5_holdings(broker) -> bool:
 
 def main():
     print("=" * 55)
-    print("  Kotak Neo API v2 — Connection Test")
+    print("  Kotak Neo API v2 - Connection Test")
     print("=" * 55)
 
     if not step0_config():

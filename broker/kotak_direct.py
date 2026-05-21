@@ -89,14 +89,16 @@ class KotakBroker:
 
     # ── Market Data ────────────────────────────────────────────────────────────
 
-    def get_quote(self, symbol: str, exchange: str = "nse_cm") -> dict:
-        """Real-time LTP, OHLC, and volume for a symbol."""
+    def get_quote(self, symbol: str, exchange: str = "nse_cm") -> list | dict:
+        """Real-time LTP, OHLC, and volume for a symbol. Returns a list of quote dicts."""
         client = self._get_client()
         scrip = self._call(client.search_scrip, exchange_segment=exchange, symbol=symbol)
         tokens = scrip if isinstance(scrip, list) else scrip.get("data", [])
         if not tokens:
             return {"error": f"Symbol {symbol} not found on {exchange}"}
-        token = tokens[0].get("pSymbol") or tokens[0].get("instrumentToken")
+        # Prefer the EQ (equity) group over BL/BE etc.
+        eq = next((t for t in tokens if t.get("pGroup") == "EQ"), tokens[0])
+        token = eq.get("pSymbol") or eq.get("instrumentToken")
         return self._call(
             client.quotes,
             instrument_tokens=[{"instrument_token": str(token), "exchange_segment": exchange}],
@@ -106,28 +108,20 @@ class KotakBroker:
     def get_ltp(self, symbol: str, exchange: str = "nse_cm") -> float | None:
         """Return the last traded price as a float, or None on error."""
         quote = self.get_quote(symbol, exchange)
-        if "error" in quote:
+        # quotes API returns a list directly; error case is a dict with "error" key
+        if isinstance(quote, dict):
             return None
-        data = quote if isinstance(quote, dict) else {}
-        # neo_api_client returns different shapes; try common keys
+        items = quote if isinstance(quote, list) else []
+        if not items:
+            return None
+        row = items[0]
         for key in ("ltp", "lastPrice", "last_price", "close"):
-            val = data.get(key)
+            val = row.get(key)
             if val is not None:
                 try:
                     return float(val)
                 except (TypeError, ValueError):
                     pass
-        # Nested under data[]
-        items = data.get("data", [])
-        if items and isinstance(items, list):
-            row = items[0]
-            for key in ("ltp", "lastPrice", "last_price", "close"):
-                val = row.get(key)
-                if val is not None:
-                    try:
-                        return float(val)
-                    except (TypeError, ValueError):
-                        pass
         return None
 
     # ── Portfolio ──────────────────────────────────────────────────────────────
@@ -159,20 +153,25 @@ class KotakBroker:
     def get_account_equity(self) -> float:
         """Total account value from limits API. Falls back to 500,000 if unavailable."""
         limits = self.get_limits()
-        for key in ("net", "total", "available", "availablecash", "availableMargin"):
+        for key in ("Net", "net", "Total", "total", "Available", "available",
+                    "availablecash", "availableMargin", "CashAvailable"):
             val = limits.get(key)
             if val is not None:
                 try:
-                    return float(val)
+                    v = float(val)
+                    if v > 0:
+                        return v
                 except (TypeError, ValueError):
                     pass
         data = limits.get("data", {})
         if isinstance(data, dict):
-            for key in ("net", "total", "available"):
+            for key in ("Net", "net", "Total", "total", "Available", "available"):
                 val = data.get(key)
                 if val is not None:
                     try:
-                        return float(val)
+                        v = float(val)
+                        if v > 0:
+                            return v
                     except (TypeError, ValueError):
                         pass
         logger.warning("Could not parse account equity from limits; using 500000")
