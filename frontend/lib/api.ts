@@ -59,3 +59,13 @@ export async function fetchTrades(limit = 50, openOnly = false) {
   const { data } = await api.get(`/trades?limit=${limit}&open_only=${openOnly}`);
   return data as any[];
 }
+
+export async function fetchIntradayBars(symbol: string, bars = 390) {
+  const { data } = await api.get(`/intraday/${symbol}?bars=${bars}`);
+  return data as any[];
+}
+
+export async function fetchIntradaySymbols() {
+  const { data } = await api.get("/intraday");
+  return data as string[];
+}

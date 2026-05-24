@@ -235,28 +235,20 @@ class TradingMathEngine:
         Falls back to trades table if trade_journal is empty.
         """
         try:
-            from supabase_client import db
-            from datetime import datetime, timezone, timedelta
+            from local_db import get_journal_entries, get_all_trades
 
-            cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
-
-            query = db.table("trade_journal").select("*").gte("created_at", cutoff)
-            if strategy_name:
-                query = query.ilike("strategy_votes", f"%{strategy_name}%")
-
-            result = query.order("created_at", desc=True).execute()
-            rows = result.data or []
+            rows = get_journal_entries(strategy_name=strategy_name, days=days)
 
             if not rows:
                 # Fallback to trades table
-                tq = db.table("trades").select("*").eq("is_open", False).gte("executed_at", cutoff)
-                tres = tq.execute()
-                rows = _normalize_trades_to_journal(tres.data or [])
+                all_t = get_all_trades(limit=500)
+                closed = [t for t in all_t if not t.get("is_open")]
+                rows = _normalize_trades_to_journal(closed)
 
             return _compute_stats(strategy_name or "ALL", rows)
 
         except Exception as exc:
-            logger.warning("Supabase stats query failed: %s", exc)
+            logger.warning("local_db stats query failed: %s", exc)
             return StrategyStats(
                 strategy_name=strategy_name or "ALL",
                 total_trades=0,
@@ -293,7 +285,7 @@ class TradingMathEngine:
         if ev is None or not ev.has_positive_edge:
             return {
                 "verdict": "NEGATIVE_EDGE",
-                "message": f"Strategy has negative EV ({ev.expected_value:.4f} if ev else 'unknown'}). Do not trade.",
+                "message": f"Strategy has negative EV ({ev.expected_value:.4f if ev else 'unknown'}). Do not trade.",
                 "recommendation": "Review entry criteria, improve R:R ratio, or abandon this strategy.",
             }
 

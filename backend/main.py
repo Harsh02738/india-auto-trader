@@ -11,8 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import settings
-from backend.db.models import init_db
-from backend.routes import portfolio, signals, options, earnings, penny, trades, pnl, ws
+from backend.routes import portfolio, signals, options, earnings, penny, trades, pnl, ws, intraday
 from backend.routes.ws import _push_loop
 
 logging.basicConfig(
@@ -24,9 +23,8 @@ logger = logging.getLogger("backend.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    await init_db()
-    logger.info("Database initialised")
+    # Startup — local_db initialises itself on import (SQLite CREATE TABLE IF NOT EXISTS)
+    import local_db  # noqa: F401 — triggers _init() to create tables
     ws_task = asyncio.create_task(_push_loop())
     logger.info("WebSocket push loop started")
     yield
@@ -58,6 +56,7 @@ app.include_router(penny.router)
 app.include_router(trades.router)
 app.include_router(pnl.router)
 app.include_router(ws.router)
+app.include_router(intraday.router)
 
 
 @app.get("/health")

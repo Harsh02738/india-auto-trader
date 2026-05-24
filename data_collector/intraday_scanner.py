@@ -246,7 +246,7 @@ def run_scan_cycle(
     """
     One full scan pass. Returns list of signals that newly crossed BUY/SELL.
     """
-    from supabase_client import upsert_signal
+    from local_db import upsert_signal
 
     t0 = time.time()
     logger.info("── Cycle %d  %s  (%d symbols) ──", cycle, now_ist().strftime("%H:%M:%S IST"), len(symbols))

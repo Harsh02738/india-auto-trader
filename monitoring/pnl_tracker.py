@@ -11,7 +11,7 @@ import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from supabase_client import db
+from local_db import get_portfolio_snapshot, get_all_trades
 from monitoring.alerts import send_eod_report
 from risk.circuit_breaker import CircuitBreaker
 
@@ -21,41 +21,29 @@ EOD_DIR = Path("data/eod")
 EOD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _get_supabase_snapshot() -> dict:
-    """Fetch latest portfolio snapshot from Supabase."""
+def _get_snapshot() -> dict:
     try:
-        result = (
-            db.table("portfolio_snapshots")
-            .select("*")
-            .order("snapshot_date", desc=True)
-            .limit(1)
-            .execute()
-        )
-        return result.data[0] if result.data else {}
+        return get_portfolio_snapshot()
     except Exception as exc:
-        logger.warning("Could not fetch Supabase snapshot: %s", exc)
+        logger.warning("Could not fetch portfolio snapshot: %s", exc)
         return {}
 
 
 def _get_today_trades() -> list[dict]:
-    """Fetch today's closed trades from Supabase."""
     try:
         today = str(date.today())
-        result = (
-            db.table("trades")
-            .select("*")
-            .eq("is_open", False)
-            .gte("executed_at", f"{today}T00:00:00+00:00")
-            .execute()
-        )
-        return result.data or []
+        all_trades = get_all_trades(limit=500)
+        return [
+            t for t in all_trades
+            if not t.get("is_open") and (t.get("executed_at") or "").startswith(today)
+        ]
     except Exception as exc:
         logger.warning("Could not fetch today's trades: %s", exc)
         return []
 
 
 async def run_eod() -> None:
-    snap         = _get_supabase_snapshot()
+    snap         = _get_snapshot()
     today_trades = _get_today_trades()
     cb           = CircuitBreaker()
     status       = cb.status_report()

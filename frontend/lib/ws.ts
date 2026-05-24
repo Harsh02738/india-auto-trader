@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { supabase, supabaseConfigured } from "@/lib/supabase";
+import { useEffect, useState } from "react";
 import type { Signal, Trade, PortfolioSnapshot } from "@/lib/supabase";
 
 export type LiveState = {
@@ -11,46 +10,72 @@ export type LiveState = {
   snapshot: PortfolioSnapshot | null;
 };
 
+const WS_URL =
+  typeof window !== "undefined"
+    ? (process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000/ws")
+    : "";
+
 export function useRealtimeTrading(): LiveState {
-  const [connected, setConnected]       = useState(false);
+  const [connected, setConnected]         = useState(false);
   const [latestSignals, setLatestSignals] = useState<Signal[]>([]);
   const [latestTrades, setLatestTrades]   = useState<Trade[]>([]);
   const [snapshot, setSnapshot]           = useState<PortfolioSnapshot | null>(null);
 
-  // Unique suffix per component mount so channel names never collide across re-renders
-  const suffix = useRef(`${Date.now()}`);
-
   useEffect(() => {
-    if (!supabaseConfigured) return;
+    if (!WS_URL) return;
 
-    const id = suffix.current;
+    let ws: WebSocket;
+    let reconnectTimer: ReturnType<typeof setTimeout>;
+    let pingInterval: ReturnType<typeof setInterval>;
 
-    const signalCh = supabase
-      .channel(`signals-${id}`)
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "signals" }, (p) => {
-        setLatestSignals((prev) => [p.new as Signal, ...prev].slice(0, 20));
-      })
-      .subscribe((status) => setConnected(status === "SUBSCRIBED"));
+    const connect = () => {
+      ws = new WebSocket(WS_URL);
 
-    const tradeCh = supabase
-      .channel(`trades-${id}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "trades" }, (p) => {
-        const t = p.new as Trade;
-        setLatestTrades((prev) => [t, ...prev.filter((x) => x.id !== t.id)].slice(0, 50));
-      })
-      .subscribe();
+      ws.onopen = () => {
+        setConnected(true);
+        pingInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) ws.send("ping");
+        }, 30_000);
+      };
 
-    const snapCh = supabase
-      .channel(`snapshot-${id}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "portfolio_snapshots" }, (p) => {
-        setSnapshot(p.new as PortfolioSnapshot);
-      })
-      .subscribe();
+      ws.onclose = () => {
+        setConnected(false);
+        clearInterval(pingInterval);
+        reconnectTimer = setTimeout(connect, 3_000);
+      };
+
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string);
+          if (msg.type === "tick") {
+            if (msg.top_signals?.length) setLatestSignals(msg.top_signals);
+            if (msg.open_trades)         setLatestTrades(msg.open_trades);
+            if (msg.snapshot && Object.keys(msg.snapshot).length)
+              setSnapshot(msg.snapshot as PortfolioSnapshot);
+          } else if (msg.type === "trade_executed") {
+            const t = msg.data as Trade;
+            setLatestTrades((prev) =>
+              [t, ...prev.filter((x) => x.id !== t.id)].slice(0, 50)
+            );
+          } else if (msg.type === "signal") {
+            const s = msg.data as Signal;
+            setLatestSignals((prev) => [s, ...prev].slice(0, 20));
+          } else if (msg.type === "trade_closed") {
+            const t = msg.data as Trade;
+            setLatestTrades((prev) => prev.map((x) => (x.id === t.id ? t : x)));
+          }
+        } catch {}
+      };
+    };
+
+    connect();
 
     return () => {
-      supabase.removeChannel(signalCh);
-      supabase.removeChannel(tradeCh);
-      supabase.removeChannel(snapCh);
+      clearTimeout(reconnectTimer);
+      clearInterval(pingInterval!);
+      ws?.close();
     };
   }, []);
 

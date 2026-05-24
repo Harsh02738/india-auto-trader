@@ -1,21 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createServerClient } from "@/lib/supabase";
+import { backendFetch } from "@/lib/supabase";
 
 export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const db = createServerClient();
-
-  const { data, error } = await db
-    .from("trades")
-    .select("*")
-    .eq("id", Number(id))
-    .single();
-
-  if (error) return NextResponse.json({ error: "Not found" }, { status: 404 });
-  return NextResponse.json(data);
+  const res = await backendFetch(`/trades/${id}`);
+  if (!res.ok) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  return NextResponse.json(await res.json());
 }
 
 export async function PATCH(
@@ -23,16 +16,12 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
-  const db = createServerClient();
   const body = await req.json();
-
-  const { data, error } = await db
-    .from("trades")
-    .update(body)
-    .eq("id", Number(id))
-    .select()
-    .single();
-
-  if (error) return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.json(data);
+  const res = await backendFetch(`/trades/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  return NextResponse.json(data, { status: res.status });
 }

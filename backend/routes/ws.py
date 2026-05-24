@@ -1,6 +1,8 @@
 """
 WebSocket endpoint that pushes live updates to the frontend.
-Clients connect to ws://localhost:8000/ws and receive JSON updates every 5 seconds.
+Clients connect to ws://localhost:8000/ws and receive JSON events:
+  - "tick" every 5s: snapshot, top signals, open trades
+  - real-time events from trade engine via local_db: trade_executed, trade_closed, signal
 """
 
 import asyncio
@@ -10,11 +12,12 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.services.data_reader import (
+from local_db import (
+    get_latest_signals,
+    get_open_trades,
     get_portfolio_snapshot,
-    get_all_signals,
-    get_market_pcr,
-    get_fii_dii,
+    register_ws_listener,
+    unregister_ws_listener,
 )
 
 logger = logging.getLogger(__name__)
@@ -23,12 +26,12 @@ router = APIRouter(tags=["websocket"])
 _connections: set[WebSocket] = set()
 
 
-async def broadcast(message: dict) -> None:
+async def broadcast(message: str | dict) -> None:
     """Send a JSON message to all connected WebSocket clients."""
     if not _connections:
         return
+    data = message if isinstance(message, str) else json.dumps(message)
     dead: set[WebSocket] = set()
-    data = json.dumps(message)
     for ws in list(_connections):
         try:
             await ws.send_text(data)
@@ -38,30 +41,42 @@ async def broadcast(message: dict) -> None:
 
 
 async def _push_loop() -> None:
-    """Background task: push updates every 5 seconds."""
-    while True:
-        try:
-            snapshot = get_portfolio_snapshot() or {}
-            signals  = get_all_signals()[:10]
-            pcr      = get_market_pcr() or {}
-            fii      = get_fii_dii() or {}
+    """Background task: heartbeat every 5s + drain local_db trade event queue."""
+    event_queue: asyncio.Queue = asyncio.Queue()
+    register_ws_listener(event_queue)
+    last_tick = 0.0
+    try:
+        while True:
+            now = asyncio.get_event_loop().time()
 
-            await broadcast({
-                "type":      "tick",
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                "snapshot":  snapshot,
-                "top_signals": signals,
-                "pcr":       pcr,
-                "fii_dii":   {
-                    "fii_net": fii.get("fii_net_today"),
-                    "dii_net": fii.get("dii_net_today"),
-                    "signal":  fii.get("signal_today"),
-                },
-            })
-        except Exception as exc:
-            logger.warning("WS push error: %s", exc)
+            if now - last_tick >= 5:
+                try:
+                    loop = asyncio.get_event_loop()
+                    signals = await loop.run_in_executor(None, lambda: get_latest_signals(limit=10))
+                    trades  = await loop.run_in_executor(None, get_open_trades)
+                    snap    = await loop.run_in_executor(None, get_portfolio_snapshot)
+                    await broadcast({
+                        "type":        "tick",
+                        "timestamp":   datetime.now(tz=timezone.utc).isoformat(),
+                        "snapshot":    snap or {},
+                        "top_signals": signals,
+                        "open_trades": trades,
+                    })
+                except Exception as exc:
+                    logger.warning("WS heartbeat error: %s", exc)
+                last_tick = now
 
-        await asyncio.sleep(5)
+            # Drain real-time trade events (already JSON strings from local_db.broadcast_event)
+            try:
+                while True:
+                    event = event_queue.get_nowait()
+                    await broadcast(event)
+            except asyncio.QueueEmpty:
+                pass
+
+            await asyncio.sleep(0.5)
+    finally:
+        unregister_ws_listener(event_queue)
 
 
 @router.websocket("/ws")
@@ -72,7 +87,6 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            # Keep alive — receive any ping/pong or close from client
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))

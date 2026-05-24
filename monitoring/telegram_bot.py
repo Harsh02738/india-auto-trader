@@ -1,5 +1,5 @@
 """
-Telegram Command Bot — full command + execution interface.
+Telegram Command Bot — notifications + command interface (paper trading mode).
 
 Commands:
   /analyze SYMBOL  (or just type a symbol / company name)
@@ -11,11 +11,7 @@ Commands:
   /resume          — resume automated scanning
   /help            — list commands
 
-Execution Flow (for /analyze or free-text company lookup):
-  1. Bot fetches OHLCV + fundamentals
-  2. Runs StrategyEngine consensus evaluation
-  3. Sends rich result card with [Execute / Skip] buttons
-  4. On Execute tap: places real Kotak Neo order + SL, sends confirmation
+Trades execute autonomously — this bot sends notifications only.
 """
 
 from __future__ import annotations
@@ -25,14 +21,12 @@ import json
 import logging
 import re
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -52,25 +46,9 @@ _bot: Bot | None = None
 _app: Application | None = None
 _lock = threading.Lock()
 
-# Legacy signal-approval set (kept for backward compat with intraday_scanner)
-_approved: set[str] = set()
-
-# Pending execution signals stored by callback key → signal dict
-_pending_executions: dict[str, dict] = {}
-
-
-# ── Legacy public API (backward compatibility) ─────────────────────────────────
-
-def pop_approved() -> set[str]:
-    """Return and clear all approved symbols. Called by legacy scanner."""
-    with _lock:
-        approved = set(_approved)
-        _approved.clear()
-    return approved
-
 
 def send_signal_alert(signal: dict) -> None:
-    """Send a legacy signal alert with Go/Skip buttons."""
+    """Send a plain signal notification (no approval buttons — autonomous mode)."""
     if not _loop or not _bot:
         return
     asyncio.run_coroutine_threadsafe(_send_legacy_alert(signal), _loop)
@@ -111,7 +89,7 @@ async def _send_legacy_alert(signal: dict) -> None:
 
     emoji = "📈" if action == "BUY" else "📉"
     lines = [
-        f"{emoji} <b>NEW SIGNAL: {action} {sym}</b>",
+        f"{emoji} <b>SIGNAL: {action} {sym}</b>",
         f"Score: <code>{score:.0f}/100</code>  [{conf}]",
     ]
     if entry: lines.append(f"Entry  ₹<code>{entry:.2f}</code>")
@@ -120,16 +98,11 @@ async def _send_legacy_alert(signal: dict) -> None:
     if rr:    lines.append(f"R:R    <code>{rr:.2f}</code>")
     lines.append(f"\n<i>{signal.get('reasoning', '')}</i>")
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Go — Execute", callback_data=f"go|{sym}"),
-        InlineKeyboardButton("❌ Skip",          callback_data=f"skip|{sym}"),
-    ]])
     try:
         await _bot.send_message(
             chat_id=chat_id,
             text="\n".join(lines),
             parse_mode="HTML",
-            reply_markup=keyboard,
         )
     except Exception as exc:
         logger.debug("Telegram send error: %s", exc)
@@ -145,7 +118,7 @@ def send_analysis_card(consensus) -> None:
 
 
 async def _send_analysis_card_coro(consensus) -> None:
-    """Format and send the rich analysis card."""
+    """Format and send the rich analysis card (info only — trades execute autonomously)."""
     chat_id = settings.telegram_chat_id
     if not chat_id or not _bot:
         return
@@ -162,30 +135,11 @@ async def _send_analysis_card_coro(consensus) -> None:
 
     emoji = "📈" if action == "BUY" else "📉"
 
-    # Build strategy vote lines
     vote_lines = []
     for name, sig in consensus.individual_signals.items():
         icon = "✅" if sig.action == action else ("❌" if sig.action == "HOLD" else "🔻")
         vote_lines.append(f"  {icon} {name} ({sig.confidence:.2f})")
 
-    # Callback key encodes symbol + timestamp to avoid stale callbacks
-    ts_key = str(int(time.time()))
-    cb_exec = f"exec|{sym}|{ts_key}"
-    cb_skip = f"skip2|{sym}|{ts_key}"
-
-    # Store signal data for execution callback
-    with _lock:
-        _pending_executions[cb_exec] = {
-            "symbol": sym,
-            "action": action,
-            "entry":  entry,
-            "stop_loss": sl,
-            "target": tg,
-            "confidence": conf,
-            "reasoning": consensus.reasoning,
-        }
-
-    # TV confluence line (if available)
     tv_action = getattr(consensus, "tv_action", "HOLD")
     tv_score  = getattr(consensus, "tv_score", 0.0)
     tv_matched = getattr(consensus, "tv_matched", False)
@@ -196,6 +150,7 @@ async def _send_analysis_card_coro(consensus) -> None:
 
     lines = [
         f"{emoji} <b>{sym} — Score: {conf:.0%} | {votes}/{total} strategies agree</b>",
+        "🤖 <i>Auto-executing…</i>",
         "",
         "Strategy votes:",
     ] + vote_lines
@@ -213,13 +168,7 @@ async def _send_analysis_card_coro(consensus) -> None:
 
     tv_chart_url = f"https://www.tradingview.com/chart/?symbol=NSE:{sym}"
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Execute", callback_data=cb_exec),
-            InlineKeyboardButton("❌ Skip",    callback_data=cb_skip),
-        ],
-        [
-            InlineKeyboardButton("📊 TV Chart", url=tv_chart_url),
-        ],
+        [InlineKeyboardButton("📊 TV Chart", url=tv_chart_url)],
     ])
 
     try:
@@ -268,14 +217,19 @@ async def _cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _cmd_positions(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏳ Fetching positions…")
     try:
-        from broker.kotak_direct import KotakBroker
-        broker = KotakBroker()
+        if settings.paper_trading:
+            from broker.paper_broker import PaperBroker
+            broker = PaperBroker()
+        else:
+            from broker.kotak_direct import KotakBroker
+            broker = KotakBroker()
         positions = broker.get_positions()
         if not positions:
             await update.message.reply_text("No open positions.")
             return
 
-        lines = ["<b>Open Positions</b>", ""]
+        label = "[PAPER] " if settings.paper_trading else ""
+        lines = [f"<b>{label}Open Positions</b>", ""]
         for pos in positions:
             if not isinstance(pos, dict):
                 continue
@@ -301,20 +255,33 @@ async def _cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = args[0].upper()
     await update.message.reply_text(f"⏳ Closing {symbol} at market…")
     try:
-        from broker.kotak_direct import KotakBroker
-        broker = KotakBroker()
-        pos = broker.get_open_position(symbol)
-        if not pos:
-            await update.message.reply_text(f"No open position found for {symbol}.")
-            return
-        qty = int(pos.get("flBuyQty") or pos.get("netQty") or pos.get("quantity") or 0)
-        product = pos.get("product") or pos.get("prd") or "MIS"
-        result = broker.place_order(symbol, "SELL", abs(qty), 0, "MKT", product, tag="MANUAL_EXIT")
-        order_id = broker.extract_order_id(result)
-        if order_id:
-            await update.message.reply_text(f"✅ Exit order placed for {symbol} qty={abs(qty)}. Order ID: {order_id}")
+        if settings.paper_trading:
+            from broker.paper_broker import PaperBroker
+            broker = PaperBroker()
+            ltp = broker.get_ltp(symbol)
+            if ltp is None:
+                await update.message.reply_text(f"No live price available for {symbol}.")
+                return
+            success = broker.close_position(symbol, ltp)
+            if success:
+                await update.message.reply_text(f"✅ [PAPER] Closed {symbol} at ₹{ltp:.2f}")
+            else:
+                await update.message.reply_text(f"❌ No open paper position found for {symbol}.")
         else:
-            await update.message.reply_text(f"❌ Exit failed: {result.get('error', result)}")
+            from broker.kotak_direct import KotakBroker
+            broker = KotakBroker()
+            pos = broker.get_open_position(symbol)
+            if not pos:
+                await update.message.reply_text(f"No open position found for {symbol}.")
+                return
+            qty = int(pos.get("flBuyQty") or pos.get("netQty") or pos.get("quantity") or 0)
+            product = pos.get("product") or pos.get("prd") or "MIS"
+            result = broker.place_order(symbol, "SELL", abs(qty), 0, "MKT", product, tag="MANUAL_EXIT")
+            order_id = broker.extract_order_id(result)
+            if order_id:
+                await update.message.reply_text(f"✅ Exit order placed for {symbol} qty={abs(qty)}. Order ID: {order_id}")
+            else:
+                await update.message.reply_text(f"❌ Exit failed: {result.get('error', result)}")
     except Exception as exc:
         logger.error("exit error: %s", exc)
         await update.message.reply_text(f"Error: {exc}")
@@ -484,15 +451,8 @@ async def _cmd_journal(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
     """Show last 10 trade journal entries."""
     await update.message.reply_text("⏳ Fetching trade journal…")
     try:
-        from supabase_client import db
-        result = (
-            db.table("trade_journal")
-            .select("symbol,outcome,final_pnl_pct,strategy_votes,tv_matched_direction,closed_at")
-            .order("closed_at", desc=True)
-            .limit(10)
-            .execute()
-        )
-        rows = result.data or []
+        from local_db import get_journal_entries
+        rows = get_journal_entries(days=90)[:10]
         if not rows:
             await update.message.reply_text("No journal entries yet. Log outcomes after each trade with log_trade_outcome().")
             return
@@ -600,214 +560,6 @@ def _fetch_data(symbol: str) -> tuple[dict, dict | None]:
     return ohlcv, fundamentals
 
 
-# ── Callback query handler ─────────────────────────────────────────────────────
-
-async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data or ""
-    parts = data.split("|")
-    action = parts[0]
-
-    # ── Legacy Go/Skip ────────────────────────────────────────────────────────
-    if action == "go" and len(parts) == 2:
-        sym = parts[1]
-        with _lock:
-            _approved.add(sym)
-        ts = datetime.now(tz=timezone.utc).strftime("%H:%M IST")
-        await query.edit_message_text(
-            f"✅ <b>{sym} approved for execution</b>\nQueued at {ts}",
-            parse_mode="HTML",
-        )
-        logger.info("Trade approved via Telegram: %s", sym)
-        return
-
-    if action == "skip" and len(parts) == 2:
-        await query.edit_message_text(f"❌ <b>{parts[1]} skipped</b>", parse_mode="HTML")
-        return
-
-    # ── New Execute callback ──────────────────────────────────────────────────
-    if action == "exec" and len(parts) == 3:
-        cb_key = data
-        with _lock:
-            signal_data = _pending_executions.pop(cb_key, None)
-
-        if signal_data is None:
-            await query.edit_message_text("⚠️ Signal expired. Please re-run /analyze.")
-            return
-
-        symbol   = signal_data["symbol"]
-        trade_action = signal_data["action"]
-
-        await query.edit_message_text(
-            f"⏳ Placing {trade_action} order for <b>{symbol}</b>…",
-            parse_mode="HTML",
-        )
-
-        result_msg = await asyncio.get_event_loop().run_in_executor(
-            None, _execute_trade, signal_data
-        )
-        await query.edit_message_text(result_msg, parse_mode="HTML")
-        return
-
-    # ── New Skip2 callback ────────────────────────────────────────────────────
-    if action == "skip2" and len(parts) == 3:
-        sym = parts[1]
-        with _lock:
-            _pending_executions.pop(data, None)
-        await query.edit_message_text(f"❌ <b>{sym} skipped</b>", parse_mode="HTML")
-        return
-
-
-# ── Trade execution (blocking, runs in executor) ───────────────────────────────
-
-def _execute_trade(signal: dict) -> str:
-    """
-    Blocking: validate, size, place order + SL. Returns a Telegram message string.
-    """
-    symbol       = signal["symbol"]
-    trade_action = signal["action"]
-    entry        = signal.get("entry", 0)
-    confidence   = signal.get("confidence", 0)
-    reasoning    = signal.get("reasoning", "")
-
-    try:
-        # Circuit breaker check
-        snap = {}
-        if SNAPSHOT_FILE.exists():
-            snap = json.loads(SNAPSHOT_FILE.read_text())
-        if snap.get("circuit_breaker", {}).get("tripped", False):
-            return "🚨 <b>Circuit breaker is TRIPPED — trade blocked.</b>\nUse /status for details."
-
-        from broker.kotak_direct import KotakBroker
-        from risk.position_sizer import PositionSizer
-        from data_collector.market_data import collect_daily
-        from supabase_client import record_trade
-        from monitoring.alerts import alert_trade_executed
-        import asyncio as _asyncio
-
-        broker = KotakBroker()
-        equity = broker.get_account_equity()
-
-        # Re-fetch live price to check for large moves since analysis
-        live_ltp = broker.get_ltp(symbol)
-        if live_ltp is None:
-            live_ltp = entry
-        price_drift = abs(live_ltp - entry) / max(entry, 1)
-        if price_drift > 0.01:
-            entry = live_ltp  # re-anchor to live price
-
-        # Get ATR for sizing
-        ohlcv = {}
-        cache = Path(f"data/market/{symbol}_ohlcv.json")
-        if cache.exists():
-            import json as _json
-            ohlcv = _json.loads(cache.read_text())
-        atr = ohlcv.get("atr") or entry * 0.02
-
-        sizer = PositionSizer(account_equity=equity)
-        sizing = sizer.equity(symbol, entry=entry, atr=atr)
-        qty = sizing.qty
-        stop_price = sizing.stop_loss_price
-        target_price = sizing.target_price
-
-        if qty < 1:
-            return f"❌ Position size too small (qty=0). Check account balance."
-
-        product = "MIS"  # default intraday; override for swing in settings
-
-        # Place entry order
-        order_result = broker.place_order(
-            symbol, trade_action, qty, round(entry, 2), "L", product, tag="TELEGRAM_EXEC"
-        )
-        order_id = broker.extract_order_id(order_result)
-        if not order_id:
-            return f"❌ Order failed: {order_result.get('error', order_result)}"
-
-        # Place stop-loss immediately after
-        sl_action = "SELL" if trade_action == "BUY" else "BUY"
-        sl_result = broker.place_stop_loss(symbol, sl_action, qty, stop_price, product)
-        sl_id = broker.extract_order_id(sl_result)
-
-        # Record trade in Supabase
-        try:
-            record_trade({
-                "order_id": order_id,
-                "symbol": symbol,
-                "tier": "EQUITY",
-                "action": trade_action,
-                "product": product,
-                "qty": qty,
-                "entry_price": round(entry, 2),
-                "stop_loss": stop_price,
-                "target": target_price,
-                "composite_score": round(confidence, 3),
-                "confidence": "HIGH" if confidence >= 0.70 else "MEDIUM",
-                "reasoning": reasoning[:500],
-                "order_type": "L",
-                "tag": "TELEGRAM_EXEC",
-                "is_open": True,
-                "sl_order_id": sl_id,
-            })
-        except Exception as exc:
-            logger.warning("Supabase record failed: %s", exc)
-
-        # Write signal file
-        _write_signal_file(symbol, trade_action, order_id, sl_id, entry, stop_price, target_price,
-                           qty, confidence, reasoning, ohlcv)
-
-        # Async Telegram alert
-        try:
-            _asyncio.run(alert_trade_executed(
-                symbol, trade_action, qty, entry, stop_price, target_price, confidence, "EQUITY"
-            ))
-        except Exception:
-            pass
-
-        rr = round((target_price - entry) / max(entry - stop_price, 0.01), 2)
-        sl_ok = f"✅ (ID: {sl_id})" if sl_id else "⚠️ SL placement failed"
-        return (
-            f"✅ <b>{trade_action} {symbol} executed!</b>\n"
-            f"Order ID: <code>{order_id}</code>\n"
-            f"Qty: {qty}  |  Entry: ₹{entry:.2f}\n"
-            f"SL: ₹{stop_price:.2f}  |  Target: ₹{target_price:.2f}\n"
-            f"R:R = {rr}  |  Risk = ₹{qty*(entry-stop_price):.0f}\n"
-            f"Stop-loss order: {sl_ok}"
-        )
-
-    except Exception as exc:
-        logger.error("Trade execution error for %s: %s", symbol, exc)
-        return f"❌ Execution error: {exc}"
-
-
-def _write_signal_file(
-    symbol, action, order_id, sl_id, entry, sl, target, qty, confidence, reasoning, ohlcv
-) -> None:
-    import json as _json
-    sig_dir = Path("data/signals")
-    sig_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "symbol": symbol,
-        "tier": "EQUITY",
-        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-        "action": action,
-        "entry_price": round(entry, 2),
-        "stop_loss": round(sl, 2),
-        "target": round(target, 2),
-        "quantity": qty,
-        "composite_score": round(confidence, 3),
-        "confidence": "HIGH" if confidence >= 0.70 else "MEDIUM",
-        "rsi": ohlcv.get("rsi"),
-        "above_ema200": ohlcv.get("above_ema200"),
-        "reasoning": reasoning[:500],
-        "executed": True,
-        "order_id": order_id,
-        "sl_order_id": sl_id,
-    }
-    (sig_dir / f"{symbol}_signal.json").write_text(_json.dumps(payload, indent=2))
-
-
 # ── Symbol resolution ─────────────────────────────────────────────────────────
 
 def _resolve_symbol(text: str) -> str | None:
@@ -883,9 +635,6 @@ async def _run_bot_async() -> None:
     app.add_handler(CommandHandler("math",      _cmd_math))
     app.add_handler(CommandHandler("journal",   _cmd_journal))
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(_handle_callback))
-
     # Free text (non-command messages)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
 
@@ -895,7 +644,7 @@ async def _run_bot_async() -> None:
     logger.info("Telegram command bot starting…")
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+    await app.updater.start_polling(allowed_updates=["message"])
 
     try:
         await asyncio.get_event_loop().create_future()

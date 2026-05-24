@@ -112,10 +112,24 @@ class Settings(BaseSettings):
     penny_volume_spike_threshold: float = 5.0   # operator activity flag
 
     # ── Multi-strategy consensus engine ───────────────────────────────────────
-    strategy_min_votes: int = Field(default=2, ge=1, le=7)
-    strategy_min_consensus_confidence: float = Field(default=0.72, ge=0.50, le=0.95)
+    strategy_min_votes: int = Field(default=3, ge=1, le=10)
+    strategy_min_consensus_confidence: float = Field(default=0.70, ge=0.50, le=0.95)
     auto_scan_enabled: bool = True
     trailing_stop_atr_mult: float = Field(default=1.5, ge=0.5, le=3.0)
+
+    # ── Paper trading ──────────────────────────────────────────────────────────
+    paper_trading: bool = True   # MUST be True for paper mode; set False only for live
+    paper_db_path: str = "data/trading.db"
+
+    # ── Anthropic (for daily stock picker web search) ──────────────────────────
+    anthropic_api_key: str = ""
+
+    # ── Daily stock picker ─────────────────────────────────────────────────────
+    stock_picker_hour: int = 10    # 10:00 AM IST
+    stock_picker_max_stocks: int = 8
+    stock_picker_min_price: float = 50.0
+    stock_picker_max_price: float = 3000.0
+    stock_picker_min_volume: int = 500_000
 
 
 settings = Settings()

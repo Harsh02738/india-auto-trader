@@ -1,29 +1,17 @@
-import { createClient } from "@supabase/supabase-js";
+// Backend is now FastAPI + SQLite — Supabase replaced.
+// This file retains type definitions and provides a fetch proxy helper.
 
-// Support both Vercel integration naming (SUPABASE_URL) and manual naming (NEXT_PUBLIC_SUPABASE_URL)
-const url     = process.env.NEXT_PUBLIC_SUPABASE_URL
-             ?? process.env.SUPABASE_URL
-             ?? "https://placeholder.supabase.co";
-const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-             ?? process.env.SUPABASE_ANON_KEY
-             ?? "placeholder";
+const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:8000";
 
-// Browser client (used by components for Realtime subscriptions)
-export const supabase = createClient(url, anonKey);
-
-// Server client (used in API routes with service-role key for full access)
-export function createServerClient() {
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY ?? anonKey;
-  return createClient(url, serviceKey, {
-    auth: { persistSession: false },
-  });
+/** Proxy helper: Next.js server routes → FastAPI backend. */
+export async function backendFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${BACKEND_URL}${path}`, init);
 }
 
-export const supabaseConfigured =
-  !!process.env.NEXT_PUBLIC_SUPABASE_URL &&
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY !== "placeholder";
+export const supabaseConfigured = false;
 
-// ── Type helpers ──────────────────────────────────────────────
+// ── Type definitions (match local_db SQLite schema) ───────────────────────────
+
 export type Trade = {
   id: number;
   order_id: string | null;
@@ -37,17 +25,13 @@ export type Trade = {
   stop_loss: number | null;
   target: number | null;
   realized_pnl: number | null;
-  is_open: boolean;
+  is_open: boolean | number;
   composite_score: number | null;
   confidence: string | null;
   reasoning: string | null;
   tag: string | null;
   executed_at: string;
   closed_at: string | null;
-  option_type: "CE" | "PE" | null;
-  strike: number | null;
-  expiry: string | null;
-  premium_paid: number | null;
 };
 
 export type Signal = {
@@ -68,12 +52,12 @@ export type Signal = {
   risk_reward: number | null;
   risk_amount_inr: number | null;
   reasoning: string | null;
-  executed: boolean;
+  executed: boolean | number;
   created_at: string;
 };
 
 export type PortfolioSnapshot = {
-  id: number;
+  id?: number;
   snapshot_date: string;
   account_equity: number | null;
   cash_available: number | null;
@@ -84,5 +68,5 @@ export type PortfolioSnapshot = {
   circuit_reason: string | null;
   consecutive_losses: number;
   drawdown_pct: number;
-  created_at: string;
+  created_at?: string;
 };

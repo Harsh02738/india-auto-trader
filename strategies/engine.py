@@ -25,11 +25,16 @@ from .macd_rsi_confluence import MacdRsiConfluenceStrategy
 from .supertrend import SupertrendStrategy
 from .vwap_reversion import VwapReversionStrategy
 from .bollinger_squeeze import BollingerSqueezeStrategy
+from .orb import ORBStrategy
+from .gap_and_go import GapAndGoStrategy
+from .cpr import CPRStrategy
+from .ema_stack import EMAStackStrategy
 
 logger = logging.getLogger(__name__)
 
-# Minimum number of strategies that must agree for a valid signal
-MIN_VOTES = 2
+# Minimum number of strategies that must agree for a valid signal.
+# Raised to 3 for intraday paper trading (tighter filter, 10 strategies total).
+MIN_VOTES = 3
 
 # LLM signal counts as a vote only when its confidence meets this threshold
 _LLM_MIN_CONFIDENCE = 0.60
@@ -70,6 +75,11 @@ class StrategyEngine:
             SupertrendStrategy(),
             VwapReversionStrategy(),
             BollingerSqueezeStrategy(),
+            # New intraday strategies for NSE paper trading
+            ORBStrategy(),
+            GapAndGoStrategy(),
+            CPRStrategy(),
+            EMAStackStrategy(),
         ]
 
     def evaluate(

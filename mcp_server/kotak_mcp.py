@@ -18,7 +18,7 @@ from pathlib import Path
 import pyotp
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from supabase_client import record_trade, close_trade as sb_close_trade
+from local_db import record_trade, close_trade as sb_close_trade
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -619,7 +619,7 @@ def log_trade_outcome(
     lessons_text: what worked / what didn't (used for self-review)
     """
     try:
-        from supabase_client import db
+        from local_db import insert_journal_entry
         from datetime import datetime, timezone
 
         # Compute math stats at entry for reference
@@ -665,9 +665,9 @@ def log_trade_outcome(
             "ror_status_at_entry":  ror_status,
             "closed_at":            datetime.now(tz=timezone.utc).isoformat(),
         }
-        result = db.table("trade_journal").insert(payload).execute()
+        entry_row = insert_journal_entry(payload)
         log.info("Trade journal entry created: %s %s %s %.2f%%", symbol, outcome, strategy_votes, final_pnl_pct * 100)
-        return {"status": "ok", "journal_id": result.data[0].get("id") if result.data else None}
+        return {"status": "ok", "journal_id": entry_row.get("id")}
     except Exception as exc:
         log.error("log_trade_outcome failed: %s", exc)
         return {"error": str(exc), "status": "failed"}
@@ -729,19 +729,8 @@ def get_recent_trade_journal(limit: int = 20) -> list:
     Each entry includes entry conditions, strategy votes, TV signal, and P&L outcome.
     """
     try:
-        from supabase_client import db
-        result = (
-            db.table("trade_journal")
-            .select("id,symbol,tier,strategy_votes,vote_count,outcome,final_pnl_pct,"
-                    "final_pnl_inr,entry_price,exit_price,tradingview_action,"
-                    "tradingview_score,tv_matched_direction,market_context,"
-                    "lessons_text,ev_at_entry,kelly_at_entry,ror_status_at_entry,"
-                    "hold_duration_hours,created_at,closed_at")
-            .order("closed_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        rows = result.data or []
+        from local_db import get_journal_entries
+        rows = get_journal_entries(days=180, limit=limit)
         # Format pnl_pct as % string for readability
         for r in rows:
             pnl = r.get("final_pnl_pct")

@@ -5,7 +5,7 @@ Writes signals to data/signals/{SYMBOL}_signal.json AND Supabase.
 """
 import json
 from pathlib import Path
-from supabase_client import upsert_signal
+from local_db import upsert_signal
 
 WATCHLIST = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY",

@@ -4,19 +4,20 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, TrendingUp, BarChart2, Calendar,
-  Zap, LineChart, Activity, Bot, X
+  Zap, LineChart, Activity, Bot, X, CandlestickChart
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebar } from "./Providers";
 
 const NAV = [
-  { href: "/",           icon: LayoutDashboard, label: "Dashboard"    },
-  { href: "/positions",  icon: Activity,         label: "Positions"    },
-  { href: "/signals",    icon: TrendingUp,        label: "Signals"      },
-  { href: "/options",    icon: BarChart2,          label: "F&O"          },
-  { href: "/earnings",   icon: Calendar,           label: "Earnings"     },
-  { href: "/penny",      icon: Zap,                label: "Penny"        },
-  { href: "/analytics",  icon: LineChart,           label: "Analytics"    },
+  { href: "/",           icon: LayoutDashboard,  label: "Dashboard" },
+  { href: "/intraday",   icon: CandlestickChart, label: "Intraday"  },
+  { href: "/positions",  icon: Activity,          label: "Positions" },
+  { href: "/signals",    icon: TrendingUp,         label: "Signals"   },
+  { href: "/options",    icon: BarChart2,           label: "F&O"       },
+  { href: "/earnings",   icon: Calendar,            label: "Earnings"  },
+  { href: "/penny",      icon: Zap,                 label: "Penny"     },
+  { href: "/analytics",  icon: LineChart,            label: "Analytics" },
 ];
 
 export default function Sidebar() {
