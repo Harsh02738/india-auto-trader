@@ -33,5 +33,15 @@ echo   All services launched in separate windows.
 echo   Browser opening: http://localhost:3000/intraday
 echo ============================================================
 echo.
-echo Press any key to close this launcher window...
+echo ============================================================
+echo   MORNING SCAN — Running via Claude Code...
+echo ============================================================
+echo.
+
+claude -p "/morning-scan"
+
+echo.
+echo ============================================================
+echo   Morning scan complete. Press any key to close.
+echo ============================================================
 pause >nul

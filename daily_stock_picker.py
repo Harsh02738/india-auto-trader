@@ -3,11 +3,11 @@ Daily Stock Picker — runs at 10:00 AM IST to select intraday trading candidate
 
 Process:
   1. Use yfinance to get Nifty 500 top movers by intraday volume/price change.
-  2. Call Claude API with web_search tool to validate picks with today's news/market context.
-  3. Filter by price range, volume, and liquidity.
-  4. Write final list to data/daily_stocks_{date}.json.
+  2. Filter by price range, volume, and liquidity.
+  3. Write final list to data/daily_stocks_{date}.json.
 
-The trade engine reads this file to know which stocks to scan during the session.
+Claude Code (/morning-scan) reads this file and performs the full 4-factor analysis
+including news validation. This module handles only the technical pre-screen.
 Falls back to top-10 Nifty 50 by volume if anything fails.
 """
 
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -92,65 +91,6 @@ def _pick_by_volume_change(symbols: list[str], max_picks: int) -> list[str]:
     return [sym for _, sym in scores[:max_picks * 2]]   # double; Claude will trim
 
 
-def _ask_claude(candidates: list[str]) -> list[str]:
-    """
-    Call Claude API with web_search to validate/refine candidates using today's news.
-    Returns a final ordered list of NSE symbols.
-    """
-    if not settings.anthropic_api_key:
-        logger.info("[StockPicker] No ANTHROPIC_API_KEY — skipping Claude validation")
-        return candidates[: settings.stock_picker_max_stocks]
-
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-
-        today = date.today().strftime("%d %B %Y")
-        prompt = (
-            f"Today is {today}. I am selecting NSE Indian equity stocks for intraday trading today.\n\n"
-            f"My technical screen identified these candidates (sorted by volume/momentum):\n"
-            f"{', '.join(candidates)}\n\n"
-            f"Please search the web for today's market news and conditions, then:\n"
-            f"1. Identify which of these stocks have strong intraday momentum catalysts today "
-            f"(earnings, news, sector tailwinds, FII activity, analyst upgrades)\n"
-            f"2. Remove any stocks with negative news (regulatory issues, earnings miss, sector headwinds)\n"
-            f"3. Add up to 2 additional high-momentum stocks NOT in my list if there are compelling "
-            f"news-driven opportunities today on NSE\n"
-            f"4. Return ONLY a Python list of 5-8 NSE ticker symbols (e.g. [\"RELIANCE\", \"TATAMOTORS\"])\n\n"
-            f"Rules: equity only (no F&O index), price ₹{settings.stock_picker_min_price:.0f}-"
-            f"₹{settings.stock_picker_max_price:.0f}, avg daily volume > 5L shares.\n"
-            f"Output format: just the Python list, nothing else."
-        )
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=512,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        # Extract text from response
-        full_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                full_text += block.text
-
-        # Parse the list from Claude's response
-        match = re.search(r'\[([^\]]+)\]', full_text)
-        if match:
-            raw = match.group(1)
-            symbols = [s.strip().strip('"').strip("'").upper() for s in raw.split(",")]
-            symbols = [s for s in symbols if re.match(r'^[A-Z&\-]+$', s) and len(s) <= 15]
-            if symbols:
-                logger.info("[StockPicker] Claude selected: %s", symbols)
-                return symbols[: settings.stock_picker_max_stocks]
-
-    except Exception as exc:
-        logger.warning("[StockPicker] Claude API call failed: %s", exc)
-
-    return candidates[: settings.stock_picker_max_stocks]
-
-
 def pick_stocks_for_today(force: bool = False) -> list[str]:
     """
     Main entry point. Returns list of NSE symbols to trade today.
@@ -182,19 +122,15 @@ def pick_stocks_for_today(force: bool = False) -> list[str]:
 
     logger.info("[StockPicker] Technical candidates: %s", candidates)
 
-    # Step 2: Claude validation + web search
-    final_symbols = _ask_claude(candidates)
+    final_symbols = candidates[: settings.stock_picker_max_stocks]
 
-    if not final_symbols:
-        final_symbols = candidates[: settings.stock_picker_max_stocks]
-
-    # Step 3: Persist
+    # Persist — Claude Code (/morning-scan) handles news validation on top of this list
     payload = {
         "date": today,
         "symbols": final_symbols,
         "candidates_screened": candidates,
         "picked_at": datetime.now(tz=timezone.utc).isoformat(),
-        "method": "yfinance_volume_rank + claude_web_search",
+        "method": "yfinance_volume_rank",
     }
     out_path.write_text(json.dumps(payload, indent=2))
     logger.info("[StockPicker] Final picks for %s: %s → %s", today, len(final_symbols), final_symbols)
