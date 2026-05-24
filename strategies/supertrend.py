@@ -75,7 +75,7 @@ class SupertrendStrategy(BaseStrategy):
         confidence = self._clamp(confidence)
 
         stop_loss = round(entry - self.ATR_MULT * atr, 2)
-        target    = round(entry + self.ATR_MULT * 2 * atr, 2)
+        target    = round(entry + self.ATR_MULT * 2.5 * atr, 2)
         rr        = round((target - entry) / max(entry - stop_loss, 0.01), 2)
 
         flip_desc = "bullish FLIP" if bullish_flip else "bullish (sustained)"

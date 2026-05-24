@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 
 import yfinance as yf
@@ -32,6 +33,11 @@ from strategies.bollinger_squeeze import BollingerSqueezeStrategy
 
 logger = logging.getLogger(__name__)
 
+# Some NSE symbols differ between our config and Yahoo Finance tickers
+YFINANCE_SYMBOL_MAP: dict[str, str] = {
+    "INFOSYS": "INFY",
+}
+
 ALL_STRATEGIES: list[BaseStrategy] = [
     MomentumStrategy(),
     MeanReversionStrategy(),
@@ -41,7 +47,10 @@ ALL_STRATEGIES: list[BaseStrategy] = [
     BollingerSqueezeStrategy(),
 ]
 
-STRATEGY_MAP: dict[str, BaseStrategy] = {s.name.lower(): s for s in ALL_STRATEGIES}
+def _strategy_key(name: str) -> str:
+    return name.lower().replace(" ", "").replace("+", "").replace("-", "")
+
+STRATEGY_MAP: dict[str, BaseStrategy] = {_strategy_key(s.name): s for s in ALL_STRATEGIES}
 
 
 @dataclass
@@ -68,10 +77,11 @@ class BacktestResult:
 
     def summary(self) -> str:
         m = self.metrics
+        sharpe_str = f"{m.sharpe_ratio:.2f}" if m.sharpe_ratio is not None else "N/A"
         lines = [
             f"Strategy: {self.strategy_name}  |  Period: {self.period}  |  Symbols: {self.symbols_tested}",
             f"  Trades: {self.total_trades}  WR: {m.win_rate*100:.1f}%  PF: {m.profit_factor:.2f}  "
-            f"Sharpe: {m.sharpe_ratio:.2f}  MDD: {m.max_drawdown*100:.1f}%",
+            f"Sharpe: {sharpe_str}  MDD: {m.max_drawdown*100:.1f}%",
             f"  Avg P&L/trade: {m.expectancy*100:.2f}%  "
             f"Best: +{m.best_trade*100:.1f}%  Worst: {m.worst_trade*100:.1f}%",
         ]
@@ -96,6 +106,8 @@ class StrategyBacktester:
         strategy: BaseStrategy,
         symbols: list[str],
         period: str = "1y",
+        start_date: str | None = None,
+        end_date: str | None = None,
     ) -> BacktestResult:
         all_pnls: list[float] = []
         all_holding_days: list[float] = []
@@ -103,7 +115,7 @@ class StrategyBacktester:
 
         for symbol in symbols:
             try:
-                trades = self._backtest_symbol(strategy, symbol, period)
+                trades = self._backtest_symbol(strategy, symbol, period, start_date, end_date)
                 for t in trades:
                     all_pnls.append(t.pnl_pct)
                     all_holding_days.append(t.holding_days)
@@ -137,9 +149,11 @@ class StrategyBacktester:
         strategy: BaseStrategy,
         symbol: str,
         period: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
     ) -> list[BacktestTrade]:
         """Run strategy on one symbol. Returns list of completed trades."""
-        df = self._fetch_ohlcv(symbol, period)
+        df = self._fetch_ohlcv(symbol, period, start_date, end_date)
         if df is None or len(df) < self.LOOKBACK_BARS + 5:
             return []
 
@@ -182,6 +196,13 @@ class StrategyBacktester:
                     ))
                     in_trade = False
             else:
+                # Skip signal generation before the requested start window
+                if start_date and date_str < start_date:
+                    continue
+                # Stop generating new entries after end window
+                if end_date and date_str > end_date:
+                    continue
+
                 # Build ohlcv dict from historical window
                 window = df.iloc[max(0, i - self.LOOKBACK_BARS): i + 1]
                 ohlcv = self._build_ohlcv_dict(window, symbol)
@@ -200,9 +221,18 @@ class StrategyBacktester:
 
         return trades
 
-    def _fetch_ohlcv(self, symbol: str, period: str) -> pd.DataFrame | None:
-        # Try cached file first
-        cache_path = Path(f"data/backtest_cache/{symbol}_{period}.parquet")
+    def _fetch_ohlcv(
+        self,
+        symbol: str,
+        period: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> pd.DataFrame | None:
+        if start_date:
+            cache_key = f"{symbol}_{start_date}_{end_date or 'now'}"
+        else:
+            cache_key = f"{symbol}_{period}"
+        cache_path = Path(f"data/backtest_cache/{cache_key}.parquet")
         if cache_path.exists():
             try:
                 return pd.read_parquet(cache_path)
@@ -210,11 +240,20 @@ class StrategyBacktester:
                 pass
 
         try:
-            ticker = yf.Ticker(f"{symbol}.NS")
-            df = ticker.history(period=period, interval="1d", auto_adjust=True)
+            yf_symbol = YFINANCE_SYMBOL_MAP.get(symbol, symbol)
+            ticker = yf.Ticker(f"{yf_symbol}.NS")
+            if start_date:
+                # Pull 400 extra calendar days before start to satisfy LOOKBACK_BARS=260
+                fetch_start = (date.fromisoformat(start_date) - timedelta(days=400)).isoformat()
+                fetch_end = (
+                    (date.fromisoformat(end_date) + timedelta(days=1)).isoformat()
+                    if end_date else None
+                )
+                df = ticker.history(start=fetch_start, end=fetch_end, interval="1d", auto_adjust=True)
+            else:
+                df = ticker.history(period=period, interval="1d", auto_adjust=True)
             if df.empty:
                 return None
-            # Cache for re-use within this session
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 df.to_parquet(cache_path)
@@ -333,8 +372,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Strategy backtester")
     parser.add_argument("--strategy", type=str, help="Strategy name (momentum, meanreversion, etc.)")
     parser.add_argument("--all",      action="store_true", help="Run all strategies")
-    parser.add_argument("--period",   type=str, default="1y", help="yfinance period (e.g. 6mo, 1y, 2y)")
+    parser.add_argument("--period",   type=str, default="1y", help="yfinance period (e.g. 6mo, 1y, 2y); ignored when --start/--end are set")
     parser.add_argument("--symbols",  type=str, help="Comma-separated symbols (default: Nifty 50)")
+    parser.add_argument("--start",    type=str, default=None, help="Start date ISO (e.g. 2026-05-12); only record entries on/after this date")
+    parser.add_argument("--end",      type=str, default=None, help="End date ISO (e.g. 2026-05-16); only record entries on/before this date")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -353,17 +394,20 @@ def main() -> None:
         key = args.strategy.lower().replace(" ", "").replace("+", "").replace("-", "")
         strat = STRATEGY_MAP.get(key)
         if strat is None:
-            print(f"Unknown strategy '{args.strategy}'. Available: {list(STRATEGY_MAP.keys())}")
+            print(f"Unknown strategy '{args.strategy}'. Available: {[s.name for s in ALL_STRATEGIES]}")
             return
         strategies = [strat]
     else:
         parser.print_help()
         return
 
+    window_label = f"{args.start}_to_{args.end}" if args.start else args.period
+
     results = []
     for strat in strategies:
-        print(f"Backtesting {strat.name} on {len(symbols)} symbols ({args.period})…")
-        result = backtester.run(strat, symbols, args.period)
+        desc = f"{args.start} to {args.end}" if args.start else args.period
+        print(f"Backtesting {strat.name} on {len(symbols)} symbols ({desc})...")
+        result = backtester.run(strat, symbols, args.period, args.start, args.end)
         results.append(result)
         print(result.summary())
 
@@ -376,7 +420,7 @@ def main() -> None:
     for r in results:
         out = {
             "strategy": r.strategy_name,
-            "period": r.period,
+            "window": window_label,
             "symbols_tested": r.symbols_tested,
             "total_trades": r.total_trades,
             "win_rate":      r.metrics.win_rate,
@@ -385,9 +429,9 @@ def main() -> None:
             "max_drawdown":  r.metrics.max_drawdown,
             "expectancy":    r.metrics.expectancy,
         }
-        path = out_dir / f"{r.strategy_name}_{args.period}.json"
+        path = out_dir / f"{r.strategy_name}_{window_label}.json"
         path.write_text(json.dumps(out, indent=2))
-        print(f"Results saved → {path}")
+        print(f"Results saved: {path}")
 
 
 if __name__ == "__main__":

@@ -184,14 +184,14 @@ class PaperBroker:
         return list(_PAPER_POSITIONS.values())
 
     def get_account_equity(self) -> float:
-        return 500_000.0   # simulated 5L capital
+        return 100_000.0   # simulated 1L capital
 
     def get_limits(self, segment: str = "equity", exchange: str = "nse_cm", product: str = "MIS") -> dict:
         open_positions = self.get_positions()
         used = sum(p.get("entry_price", 0) * p.get("qty", 0) for p in open_positions)
         return {
-            "cash_available": max(0, 500_000 - used),
-            "net_available": max(0, 500_000 - used),
+            "cash_available": max(0, 100_000 - used),
+            "net_available": max(0, 100_000 - used),
             "paper": True,
         }
 
