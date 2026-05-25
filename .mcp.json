@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "claude-trader": {
+      "command": "python",
+      "args": ["-m", "mcp_servers.claude_trader"],
+      "cwd": "c:/Users/Harsh Shah/OneDrive/Desktop/Claude-Coding/india-auto-trader"
+    }
+  }
+}

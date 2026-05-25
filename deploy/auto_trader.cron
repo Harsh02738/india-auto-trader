@@ -1,0 +1,30 @@
+# Claude Trader — Oracle Cloud Cron Schedule (IST timezone)
+# Install with: crontab deploy/auto_trader.cron
+#
+# Assumes TZ=Asia/Kolkata is set system-wide (timedatectl set-timezone Asia/Kolkata)
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+TZ=Asia/Kolkata
+PYTHONPATH=/home/ubuntu/india-auto-trader
+LOG=/home/ubuntu/india-auto-trader/logs/auto_trader.log
+
+# Daily git pull before market open (8:55 AM IST)
+55 8 * * 1-5  cd /home/ubuntu/india-auto-trader && git pull origin master >> $LOG 2>&1
+
+# Pre-market stock selection — Claude picks 8 stocks from news (9:00 AM IST)
+0 9 * * 1-5   cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task pick-stocks >> $LOG 2>&1
+
+# Market scans — every 10 min from 9:15 AM to 2:55 PM IST
+15,25,35,45,55 9  * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task scan >> $LOG 2>&1
+5,15,25,35,45,55 10 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task scan >> $LOG 2>&1
+5,15,25,35,45,55 11 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task scan >> $LOG 2>&1
+5,15,25,35,45,55 12 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task scan >> $LOG 2>&1
+5,15,25,35,45,55 13 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task scan >> $LOG 2>&1
+5,15,25,35,45,55 14 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task scan >> $LOG 2>&1
+
+# MIS square-off (3:10 PM IST)
+10 15 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task squareoff >> $LOG 2>&1
+
+# EOD report (3:45 PM IST)
+45 15 * * 1-5  cd /home/ubuntu/india-auto-trader && python3 auto_trader.py --task eod >> $LOG 2>&1

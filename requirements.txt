@@ -1,0 +1,34 @@
+# Core trading & data
+anthropic>=0.40.0
+yfinance>=1.3.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# MCP server
+fastmcp>=3.3.1
+
+# Charts
+mplfinance>=0.12.10b0
+matplotlib>=3.7.0
+
+# News fetching
+feedparser>=6.0.11
+
+# Broker (Kotak Neo)
+neo_api_client>=2.0.0
+websockets>=12.0
+
+# Technical indicators
+scipy>=1.11.0
+
+# Monitoring
+pytz>=2024.1
+
+# Telegram notifications
+# (uses requests — already listed above)
+
+# Utilities
+pyotp>=2.8.0
+python-dateutil>=2.9.0

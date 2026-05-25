@@ -14,6 +14,32 @@ You are an expert Indian equity trader and quantitative analyst operating an aut
 
 ---
 
+## MCP Tools Available (Claude Trader — Primary System)
+
+> **New system**: Claude Code IS the trading brain. Call these tools to get charts, signals, and execute trades.
+
+### Stock Selection & News
+- `mcp__claude-trader__get_news_headlines(date?)` → list of {source, headline, symbol_hint} from ET Markets RSS + Moneycontrol RSS + NSE announcements
+
+### Charts & Analysis
+- `mcp__claude-trader__build_chart(symbol)` → `{chart_base64, chart_path, summary}` — PNG with candlesticks, EMA-9/21, VWAP, Bollinger Bands, RSI, volume; strategy signal arrow at last bar
+- `mcp__claude-trader__get_strategy_signals(symbol)` → full ConsensusSignal JSON: action, vote_count, individual strategy votes, entry/SL/target, reasoning
+- `mcp__claude-trader__get_ohlcv(symbol)` → OHLCV snapshot: last_close, rsi, vwap, atr, vol_ratio, or_high, or_low, etc.
+
+### Trade Execution
+- `mcp__claude-trader__execute_trade(symbol, action, entry, stop_loss, target, reasoning)` → places paper/live order with ATR-based sizing; checks circuit breaker first
+- `mcp__claude-trader__close_position(symbol, reason?)` → closes position at market price
+- `mcp__claude-trader__get_portfolio_status()` → circuit breaker state, daily P&L, equity, open_positions count
+- `mcp__claude-trader__get_open_positions()` → list of positions with live P&L, SL, target
+
+### Backtesting
+- `mcp__claude-trader__run_backtest(symbol, days=60)` → bar-by-bar backtest on yfinance 5m data; returns win_rate, total_pnl, avg_win, avg_loss, max_drawdown, chart_path
+
+### Logging
+- `mcp__claude-trader__log_decision(symbol, action, confidence, reasoning, strategy_votes?, chart_path?, executed?, entry?, stop_loss?, target?)` → write to daily decisions log
+
+---
+
 ## MCP Tools Available (Kotak Neo)
 
 ### Portfolio
@@ -80,6 +106,70 @@ You are an expert Indian equity trader and quantitative analyst operating an aut
 ---
 
 ## Skills (Slash Commands)
+
+### /pick-stocks
+Pre-market stock selection using Claude Trader MCP tools (run at 9:00 AM IST):
+
+1. `mcp__claude-trader__get_news_headlines()` → fetch ET Markets + Moneycontrol + NSE headlines
+2. Analyze all headlines — identify exactly **8 NSE-listed stocks** (Nifty 500) most likely to move today
+   - Prioritize: earnings surprises, large contracts, regulatory decisions, FII flow signals, sector momentum
+3. `mcp__claude-trader__log_decision(symbol='UNIVERSE', action='PICK', confidence=1.0, reasoning=<analysis>, strategy_votes=<8 symbols comma-separated>)`
+4. Send Telegram with the day's picks
+
+Fallback: if news APIs are down, use `daily_stock_picker.pick_stocks_for_today()` (volume-rank method).
+
+---
+
+### /claude-scan
+Full 10-minute market analysis cycle (run every 10 min, 9:15 AM – 3:00 PM IST):
+
+1. `mcp__claude-trader__get_portfolio_status()` → if circuit breaker tripped, **STOP immediately**
+2. `mcp__claude-trader__get_open_positions()` → note which symbols already have positions
+3. For **each of today's 8 stocks** (skip if already in position):
+   a. `mcp__claude-trader__get_strategy_signals(symbol)` → read quantitative vote breakdown
+   b. `mcp__claude-trader__build_chart(symbol)` → **look at the chart carefully**:
+      - Price vs VWAP (above = bullish, below = bearish)
+      - EMA-9 vs EMA-21 alignment (golden cross / death cross)
+      - RSI level and momentum direction
+      - Volume ratio (≥1.5x = conviction, <0.8x = skip breakouts)
+      - Bollinger Band position (squeeze = impending move)
+      - OR breakout: price above or_high = bullish breakout trigger
+   c. Combine chart analysis + strategy votes → decide BUY / SELL / HOLD
+   d. `mcp__claude-trader__log_decision(symbol, action, confidence, reasoning, strategy_votes, chart_path, executed=False, entry, stop_loss, target)`
+   e. If `action != HOLD` AND `confidence >= 0.70`:
+      - `mcp__claude-trader__execute_trade(symbol, action, entry, stop_loss, target, reasoning)`
+      - Update `log_decision(..., executed=True)`
+4. Check open positions for exits:
+   - For each open position, check if `ltp >= target` (take profit) or `ltp <= stop_loss` (cut loss)
+   - `mcp__claude-trader__close_position(symbol, reason)` when triggered
+
+**Thresholds**: BUY/SELL requires confidence ≥ 0.70. Never trade against VWAP with vol_ratio < 0.8.
+
+---
+
+### /run-backtest SYMBOL [DAYS]
+Validate strategies on historical data before committing capital:
+
+1. `mcp__claude-trader__run_backtest(symbol, days=60)` → runs bar-by-bar on yfinance 5m data
+2. Read returned metrics: `win_rate`, `total_pnl`, `avg_win`, `avg_loss`, `max_drawdown`, `n_trades`
+3. Open `chart_path` to inspect where signals fired visually
+4. Verdict: proceed with this symbol only if `win_rate > 50%` and `total_pnl > 0`
+
+Run this for all 8 daily picks before going live.
+
+---
+
+### /check-exits
+Monitor open positions for target/stop hits (called within /claude-scan or standalone):
+
+1. `mcp__claude-trader__get_open_positions()` → list all positions with `ltp`, `unrealised_pnl`, `stop_loss`, `target`
+2. For each position:
+   - BUY position: exit if `ltp >= target` (profit) or `ltp <= stop_loss` (loss)
+   - SELL position: exit if `ltp <= target` (profit) or `ltp >= stop_loss` (loss)
+3. `mcp__claude-trader__close_position(symbol, reason)` for triggered positions
+4. At 15:10 IST: force close ALL remaining MIS positions regardless of P&L
+
+---
 
 ### /analyze-stock SYMBOL
 Full 4-factor analysis of a single stock:
