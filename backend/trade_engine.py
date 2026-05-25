@@ -209,10 +209,8 @@ def _scan_loop() -> None:
 
 def _run_scan(alerted_today: set[str]) -> None:
     from strategies.engine import StrategyEngine
-    from risk.position_sizer import PositionSizer
 
     engine = StrategyEngine(min_votes=AUTO_EXEC_MIN_VOTES)
-    sizer  = PositionSizer()
     broker = _get_broker()
     symbols = _get_scan_symbols()
 
@@ -260,14 +258,14 @@ def _run_scan(alerted_today: set[str]) -> None:
                     symbol, consensus.action,
                     consensus.combined_confidence, consensus.vote_count, consensus.total_strategies
                 )
-                _execute_signal(broker, sizer, consensus)
+                _execute_signal(broker, consensus)
                 alerted_today.add(symbol)
 
         except Exception as exc:
             logger.debug("[Scan] Error for %s: %s", symbol, exc)
 
 
-def _execute_signal(broker, sizer, consensus) -> None:
+def _execute_signal(broker, consensus) -> None:
     """Execute a paper trade autonomously and notify via Telegram."""
     from local_db import record_trade, upsert_signal, broadcast_event
 
@@ -277,12 +275,15 @@ def _execute_signal(broker, sizer, consensus) -> None:
     sl     = consensus.stop_loss
     target = consensus.target
 
-    # Size position
+    # Size position using ATR-based formula: 2% risk, 5% notional cap
     try:
         equity = broker.get_account_equity()
-        qty = sizer.size_equity(equity, entry, sl, settings.max_account_risk_pct)
     except Exception:
-        qty = max(1, int(500_000 * 0.02 / max(abs(entry - sl), entry * 0.01)))
+        equity = 500_000.0
+    stop_dist = max(abs(entry - sl), entry * 0.02)
+    max_by_risk     = int(equity * settings.max_account_risk_pct / stop_dist)
+    max_by_notional = int(equity * settings.max_single_stock_pct / entry)
+    qty = max(1, min(max_by_risk, max_by_notional))
 
     if qty <= 0:
         logger.debug("[Exec] %s: qty=0 after sizing — skip", symbol)
