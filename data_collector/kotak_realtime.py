@@ -129,14 +129,21 @@ class SymbolTracker:
         self.prev_day_close: float | None = None
         self._ema9:  float | None = None
         self._ema21: float | None = None
+        self._avg_volume_20d: float | None = None
+        self._daily_atr: float | None = None
         self._load_prev_day()
 
     def _load_prev_day(self) -> None:
-        """Load previous day's H/L/C from daily cache for CPR strategy."""
+        """Load previous day's H/L/C, avg volume, and ATR from daily cache."""
         try:
             path = MARKET_DIR / f"{self.symbol}_ohlcv.json"
             if path.exists():
                 data = json.loads(path.read_text())
+                # Load daily average volume for meaningful vol_ratio
+                self._avg_volume_20d = data.get("avg_volume_20d") or data.get("avg_vol_20d")
+                # Load daily ATR as floor for intraday ATR (1m ATR can be tiny)
+                if data.get("interval") == "1d":
+                    self._daily_atr = data.get("atr")
                 candles = data.get("candles", [])
                 if len(candles) >= 2:
                     prev = candles[-2]   # second-to-last daily bar
@@ -206,6 +213,9 @@ class SymbolTracker:
 
         vwap = _compute_vwap(bars)
         atr  = _compute_atr(bars, period=14)
+        # 1m ATR can be extremely small (< 0.3% of price); use daily ATR as floor
+        if self._daily_atr and last_close > 0 and atr / last_close < 0.003:
+            atr = self._daily_atr
         rsi  = _compute_rsi(bars, period=14)
         macd_line, macd_sig, macd_hist = _compute_macd(bars)
         prev_hist = _compute_macd(bars[:-1])[2] if len(bars) > 1 else 0.0
@@ -219,9 +229,17 @@ class SymbolTracker:
         bb_lower = bb_mean - 2 * bb_std
         bb_pct   = (last_close - bb_lower) / max(bb_upper - bb_lower, 0.0001)
 
-        vol_today = sum(b["v"] for b in bars[-20:])
-        vol_prev  = sum(b["v"] for b in bars[-40:-20]) if len(bars) >= 40 else vol_today
-        vol_ratio = round(vol_today / max(vol_prev, 1), 2)
+        session_vol = sum(b["v"] for b in bars) if bars else 0
+        if self._avg_volume_20d and self._avg_volume_20d > 0:
+            # Normalise against expected volume at this point in the session
+            # 375 bars ≈ full 6.25-hour NSE session in 1-min bars
+            elapsed_frac = max(len(bars) / 375.0, 0.05)
+            expected_vol = self._avg_volume_20d * elapsed_frac
+            vol_ratio = round(session_vol / max(expected_vol, 1), 2)
+        else:
+            vol_today = sum(b["v"] for b in bars[-20:])
+            vol_prev  = sum(b["v"] for b in bars[-40:-20]) if len(bars) >= 40 else max(vol_today, 1)
+            vol_ratio = round(vol_today / max(vol_prev, 1), 2)
 
         payload = {
             "symbol":         self.symbol,
@@ -290,14 +308,12 @@ class KotakRealtimeCollector:
     def _get_broker(self):
         if self._broker is None:
             try:
-                if settings.paper_trading:
-                    from broker.paper_broker import PaperBroker
-                    self._broker = PaperBroker()
-                else:
-                    from broker.kotak_direct import KotakBroker
-                    self._broker = KotakBroker()
+                # Always use real KotakBroker for market data — paper trading only
+                # affects order execution, not live quote/volume collection.
+                from broker.kotak_direct import KotakBroker
+                self._broker = KotakBroker()
             except Exception as exc:
-                logger.error("[Realtime] Could not init broker: %s", exc)
+                logger.error("[Realtime] Could not init KotakBroker for market data: %s", exc)
         return self._broker
 
     def _is_market_open(self) -> bool:

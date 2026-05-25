@@ -597,10 +597,20 @@ def start_engine() -> None:
     try:
         from data_collector.kotak_realtime import get_collector
         collector = get_collector()
-        # Pre-load any existing picks
+        # Pre-load any persisted picks immediately so the Opening Range window
+        # (9:15–9:30 AM) is captured — engine must be started before 9:15 AM.
         initial_stocks = _get_scan_symbols()
         collector.start(initial_stocks)
         logger.info("[Engine] Realtime collector started for %d symbols", len(initial_stocks))
+        # Also seed with today's saved picks if already available (idempotent)
+        try:
+            from daily_stock_picker import load_today_stocks
+            saved_picks = load_today_stocks()
+            if saved_picks:
+                collector.update_symbols(saved_picks)
+                logger.info("[Engine] Pre-loaded %d symbols for OR tracking", len(saved_picks))
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("[Engine] Could not start realtime collector: %s", exc)
 

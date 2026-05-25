@@ -137,7 +137,12 @@ async def _send_analysis_card_coro(consensus) -> None:
 
     vote_lines = []
     for name, sig in consensus.individual_signals.items():
-        icon = "✅" if sig.action == action else ("❌" if sig.action == "HOLD" else "🔻")
+        if sig.action == "HOLD":
+            icon = "➖"
+        elif sig.action == action and action != "HOLD":
+            icon = "✅"
+        else:
+            icon = "🔻"
         vote_lines.append(f"  {icon} {name} ({sig.confidence:.2f})")
 
     tv_action = getattr(consensus, "tv_action", "HOLD")
@@ -148,9 +153,18 @@ async def _send_analysis_card_coro(consensus) -> None:
         tv_icon = "✅" if tv_matched else "⚠️"
         tv_line = f"{tv_icon} TradingView: {tv_action} ({tv_score:.0%} confluence)"
 
+    _AUTO_CONF  = 0.70
+    _AUTO_VOTES = 3
+    if action == "HOLD":
+        status_line = "⏸ <i>No trade signal</i>"
+    elif conf >= _AUTO_CONF and votes >= _AUTO_VOTES:
+        status_line = "🤖 <i>Auto-executing…</i>"
+    else:
+        status_line = f"📊 <i>Below threshold — not trading (need {_AUTO_CONF:.0%} conf + {_AUTO_VOTES} votes)</i>"
+
     lines = [
         f"{emoji} <b>{sym} — Score: {conf:.0%} | {votes}/{total} strategies agree</b>",
-        "🤖 <i>Auto-executing…</i>",
+        status_line,
         "",
         "Strategy votes:",
     ] + vote_lines
@@ -158,10 +172,13 @@ async def _send_analysis_card_coro(consensus) -> None:
     if tv_line:
         lines += ["", tv_line]
 
+    if action != "HOLD":
+        lines += [
+            "",
+            f"Entry: ₹<code>{entry:.2f}</code>  |  SL: ₹<code>{sl:.2f}</code>  |  Target: ₹<code>{tg:.2f}</code>",
+            f"R:R = <code>{rr:.1f}</code>",
+        ]
     lines += [
-        "",
-        f"Entry: ₹<code>{entry:.2f}</code>  |  SL: ₹<code>{sl:.2f}</code>  |  Target: ₹<code>{tg:.2f}</code>",
-        f"R:R = <code>{rr:.1f}</code>",
         "",
         f"<i>{consensus.reasoning[:200]}</i>",
     ]
