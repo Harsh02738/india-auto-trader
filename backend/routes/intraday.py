@@ -5,9 +5,13 @@ Reads from data/realtime/{symbol}_1m.json written by KotakRealtimeCollector.
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 router = APIRouter(prefix="/intraday", tags=["intraday"])
 
@@ -28,7 +32,25 @@ async def get_intraday(symbol: str, bars: int = 390):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Read error: {exc}")
 
-    return data[-bars:] if isinstance(data, list) else data
+    # File is a dict written by KotakRealtimeCollector; candles are under "candles" key
+    if isinstance(data, dict):
+        raw = data.get("candles", [])
+        parsed = []
+        for b in raw:
+            if not all(k in b for k in ("t", "o", "h", "l", "c", "v")):
+                continue
+            try:
+                # "t" is "2026-05-25T09:21" — parse as IST, convert to UTC unix seconds
+                ts = int(datetime.fromisoformat(b["t"]).replace(tzinfo=_IST).timestamp())
+            except Exception:
+                continue
+            parsed.append({
+                "time": ts, "open": b["o"], "high": b["h"],
+                "low": b["l"], "close": b["c"], "volume": b["v"],
+            })
+        data = parsed
+
+    return data[-bars:]
 
 
 @router.get("")
