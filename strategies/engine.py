@@ -1,7 +1,7 @@
 """
 Strategy Consensus Engine.
 
-Runs all 6 quantitative strategies + optional existing 4-factor composite score,
+Runs 10 quantitative strategies + 4-factor composite score vote,
 then returns a consensus signal if ≥ MIN_VOTES strategies agree on direction.
 
 Usage:
@@ -33,11 +33,7 @@ from .ema_stack import EMAStackStrategy
 logger = logging.getLogger(__name__)
 
 # Minimum number of strategies that must agree for a valid signal.
-# Raised to 3 for intraday paper trading (tighter filter, 10 strategies total).
 MIN_VOTES = 3
-
-# LLM signal counts as a vote only when its confidence meets this threshold
-_LLM_MIN_CONFIDENCE = 0.60
 
 
 @dataclass
@@ -54,9 +50,6 @@ class ConsensusSignal:
     risk_reward: float
     individual_signals: dict[str, StrategySignal]   # name → signal
     reasoning: str
-    llm_action: str = "HOLD"          # Free LLM analysis vote
-    llm_score: float = 0.0            # LLM confidence 0-1
-    llm_matched: bool = False         # True if LLM agreed with consensus direction
 
 
 class StrategyEngine:
@@ -75,7 +68,6 @@ class StrategyEngine:
             SupertrendStrategy(),
             VwapReversionStrategy(),
             BollingerSqueezeStrategy(),
-            # New intraday strategies for NSE paper trading
             ORBStrategy(),
             GapAndGoStrategy(),
             CPRStrategy(),
@@ -87,15 +79,10 @@ class StrategyEngine:
         symbol: str,
         ohlcv: dict,
         fundamentals: dict | None = None,
-        use_llm: bool = True,
     ) -> ConsensusSignal:
         """
         Run all strategies and return a ConsensusSignal.
         Returns action=HOLD if fewer than min_votes strategies agree.
-
-        A free LLM analysis (Groq/Cerebras) is fetched as an optional 8th vote.
-        LLM only counts if its confidence >= _LLM_MIN_CONFIDENCE AND at least one
-        existing strategy already votes in the same direction (never sole trigger).
         """
         individual: dict[str, StrategySignal] = {}
         for strat in self._strategies:
@@ -109,15 +96,6 @@ class StrategyEngine:
         composite_vote = self._composite_vote(symbol, ohlcv, fundamentals)
         if composite_vote is not None:
             individual["Composite4F"] = composite_vote
-
-        # Free LLM analysis vote (optional 8th signal)
-        llm_action = "HOLD"
-        llm_score = 0.0
-        llm_vote: StrategySignal | None = None
-        if use_llm:
-            llm_action, llm_score, llm_vote = self._llm_vote(symbol, ohlcv, fundamentals, individual)
-            if llm_vote is not None:
-                individual["LLMAnalysis"] = llm_vote
 
         total = len(individual)
         entry = ohlcv.get("last_close", 0)
@@ -137,7 +115,6 @@ class StrategyEngine:
             agreeing    = sell_signals
 
         vote_count = len(agreeing)
-        llm_matched = llm_action == best_action and llm_action != "HOLD"
 
         if vote_count < self.min_votes:
             return ConsensusSignal(
@@ -156,9 +133,6 @@ class StrategyEngine:
                     f"Only {vote_count}/{total} strategies agree — "
                     f"minimum {self.min_votes} required for trade"
                 ),
-                llm_action=llm_action,
-                llm_score=llm_score,
-                llm_matched=llm_matched,
             )
 
         # Aggregate entry, stop, target from agreeing strategies
@@ -170,11 +144,9 @@ class StrategyEngine:
 
         strategy_names = sorted(agreeing.keys())
         reasoning_parts = [f"{n}({s.confidence:.2f})" for n, s in agreeing.items()]
-        llm_note = f" | LLM:{llm_action}({llm_score:.0%})" if llm_action != "HOLD" else ""
         reasoning = (
             f"{vote_count}/{total} strategies agree {best_action}: "
             + ", ".join(reasoning_parts)
-            + llm_note
         )
 
         return ConsensusSignal(
@@ -190,75 +162,7 @@ class StrategyEngine:
             risk_reward=round(avg_rr, 2),
             individual_signals=individual,
             reasoning=reasoning,
-            llm_action=llm_action,
-            llm_score=round(llm_score, 3),
-            llm_matched=llm_matched,
         )
-
-    @staticmethod
-    def _llm_vote(
-        symbol: str,
-        ohlcv: dict,
-        fundamentals: dict | None,
-        existing_signals: dict[str, StrategySignal],
-    ) -> tuple[str, float, StrategySignal | None]:
-        """
-        Call a free LLM API (Groq/Cerebras) and convert its response to a StrategySignal.
-        LLM only gets a vote if:
-          1. Its confidence >= _LLM_MIN_CONFIDENCE
-          2. At least one existing strategy already votes in the same direction
-             (LLM confirms, never initiates a signal on its own)
-        Returns (llm_action, llm_score, signal_or_None).
-        """
-        try:
-            import json
-            from pathlib import Path
-            from llm_analyzer.analyzer import LLMAnalyzer
-
-            # Load sentiment and news data if available
-            sentiment: dict | None = None
-            sent_path = Path(f"data/sentiment/{symbol}_sent.json")
-            if sent_path.exists():
-                try:
-                    sentiment = json.loads(sent_path.read_text())
-                except Exception:
-                    pass
-
-            news: list | None = None
-            news_path = Path(f"data/news/{symbol}_news.json")
-            if news_path.exists():
-                try:
-                    raw_news = json.loads(news_path.read_text())
-                    news = raw_news if isinstance(raw_news, list) else raw_news.get("items", [])
-                except Exception:
-                    pass
-
-            analyzer = LLMAnalyzer()
-            signal = analyzer.analyze(symbol, ohlcv, fundamentals, sentiment, news)
-
-            if signal is None or signal.action == "HOLD":
-                return signal.action if signal else "HOLD", 0.0, None
-
-            llm_action = signal.action
-            llm_score = signal.confidence
-
-            if llm_score < _LLM_MIN_CONFIDENCE:
-                return llm_action, llm_score, None
-
-            # Only add as a vote if at least one existing signal agrees
-            existing_same_direction = [
-                s for s in existing_signals.values() if s.action == llm_action
-            ]
-            if not existing_same_direction:
-                logger.debug("[LLM] %s %s conf=%.2f but no existing strategy agrees — not voting",
-                             symbol, llm_action, llm_score)
-                return llm_action, llm_score, None
-
-            return llm_action, llm_score, signal
-
-        except Exception as exc:
-            logger.debug("[LLM] %s vote skipped: %s", symbol, exc)
-            return "HOLD", 0.0, None
 
     # ── 4-Factor Composite Score helper ───────────────────────────────────────
 

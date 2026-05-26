@@ -1,9 +1,9 @@
 {
   "mcpServers": {
-    "claude-trader": {
-      "command": "c:/Users/Harsh Shah/OneDrive/Desktop/Claude-Coding/india-auto-trader/.venv/Scripts/python.exe",
-      "args": ["-m", "mcp_servers.claude_trader"],
-      "cwd": "c:/Users/Harsh Shah/OneDrive/Desktop/Claude-Coding/india-auto-trader"
+    "kotak-neo": {
+      "command": "C:\\Python314\\python.exe",
+      "args": ["kotak_mcp_server.py"],
+      "cwd": "C:\\Users\\Harsh Shah\\OneDrive\\Desktop\\Claude-Coding\\india-auto-trader"
     }
   }
 }

@@ -1,17 +1,22 @@
 {
-  "mcpServers": {
-    "kotak-neo": {
-      "command": "python",
-      "args": ["mcp_server/kotak_mcp.py"],
-      "cwd": "C:\\Users\\Harsh Shah\\OneDrive\\Desktop\\Claude-Coding\\india-auto-trader"
-    }
-  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": ["claude-trader"],
   "permissions": {
     "allow": [
       "Read(data/**)",
       "Write(data/**)",
       "Read(config/**)",
-      "Read(claude_prompts/**)"
+      "Read(claude_prompts/**)",
+      "mcp__claude-trader__get_portfolio_status",
+      "mcp__claude-trader__get_open_positions",
+      "mcp__claude-trader__get_ohlcv",
+      "mcp__claude-trader__get_strategy_signals",
+      "mcp__claude-trader__get_news_headlines",
+      "mcp__claude-trader__build_chart",
+      "mcp__claude-trader__log_decision",
+      "mcp__claude-trader__run_backtest",
+      "mcp__claude-trader__execute_trade",
+      "mcp__claude-trader__close_position"
     ]
   }
 }
