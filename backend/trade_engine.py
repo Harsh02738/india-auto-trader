@@ -236,11 +236,25 @@ def _run_scan(alerted_today: set[str]) -> None:
             continue
 
         try:
-            # Load realtime OHLCV (from kotak_realtime.py or cached yfinance data)
+            # Load realtime OHLCV (from kotak_realtime.py; fallback to yfinance)
             cache = Path(f"data/market/{symbol}_ohlcv.json")
-            if not cache.exists():
+            ohlcv = None
+            if cache.exists():
+                ohlcv = json.loads(cache.read_text())
+                if len(ohlcv.get("candles", [])) < 30:
+                    ohlcv = None  # not enough bars — force yfinance refresh
+            if ohlcv is None:
+                try:
+                    from data_collector.kotak_realtime import SymbolTracker, MARKET_DIR
+                    tracker = SymbolTracker(symbol)
+                    tracker.bootstrap_yfinance()
+                    tracker.save()
+                    ohlcv = tracker.to_ohlcv_payload()
+                except Exception as bf_exc:
+                    logger.debug("[Scan] yfinance bootstrap for %s failed: %s", symbol, bf_exc)
+                    continue
+            if not ohlcv:
                 continue
-            ohlcv = json.loads(cache.read_text())
 
             # Load fundamentals if available (not critical for intraday)
             fund_path = Path(f"data/fundamentals/{symbol}_fund.json")

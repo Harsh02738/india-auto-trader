@@ -140,7 +140,10 @@ class StrategyEngine:
         avg_entry     = entry  # always use live price
         avg_sl        = sum(s.stop_loss for s in agreeing.values()) / vote_count
         avg_target    = sum(s.target for s in agreeing.values()) / vote_count
-        avg_rr        = (avg_target - avg_entry) / max(avg_entry - avg_sl, 0.01)
+        if best_action == "BUY":
+            avg_rr = (avg_target - avg_entry) / max(avg_entry - avg_sl, 0.01)
+        else:  # SELL: risk = sl - entry, reward = entry - target
+            avg_rr = (avg_entry - avg_target) / max(avg_sl - avg_entry, 0.01)
 
         strategy_names = sorted(agreeing.keys())
         reasoning_parts = [f"{n}({s.confidence:.2f})" for n, s in agreeing.items()]

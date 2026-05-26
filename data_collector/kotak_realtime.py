@@ -155,6 +155,76 @@ class SymbolTracker:
         except Exception as exc:
             logger.debug("[Realtime] Could not load prev day for %s: %s", self.symbol, exc)
 
+    def bootstrap_yfinance(self) -> None:
+        """Pre-load today's 1-min bars + prev-day H/L/C from yfinance (cold start)."""
+        try:
+            import yfinance as yf
+
+            ticker = f"{self.symbol}.NS"
+            tk = yf.Ticker(ticker)
+
+            # Fetch prev-day daily data for H/L/C and avg volume
+            daily_df = tk.history(period="30d", interval="1d")
+            if daily_df is not None and not daily_df.empty:
+                daily_df.index = daily_df.index.tz_localize(None) if daily_df.index.tzinfo else daily_df.index
+                if len(daily_df) >= 2:
+                    prev = daily_df.iloc[-2]
+                    self.prev_day_high  = float(prev["High"])
+                    self.prev_day_low   = float(prev["Low"])
+                    self.prev_day_close = float(prev["Close"])
+                vols = [int(r) for r in daily_df["Volume"].tail(20) if r > 0]
+                if vols:
+                    self._avg_volume_20d = sum(vols) / len(vols)
+
+            # Fetch today's + yesterday's 1-min bars (yfinance 2d gives today)
+            df = tk.history(period="2d", interval="1m")
+            if df is None or df.empty:
+                return
+            df.index = df.index.tz_localize(None) if df.index.tzinfo else df.index
+
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            today_df  = df[df.index.strftime("%Y-%m-%d") == today_str]
+
+            # If today has < 30 bars, include yesterday too for indicator warmup
+            if len(today_df) < 30:
+                today_df = df
+
+            for ts, row in today_df.iterrows():
+                bar = {
+                    "t": ts.strftime("%Y-%m-%dT%H:%M"),
+                    "o": round(float(row["Open"]),  2),
+                    "h": round(float(row["High"]),  2),
+                    "l": round(float(row["Low"]),   2),
+                    "c": round(float(row["Close"]), 2),
+                    "v": int(row["Volume"]),
+                }
+                self.bars.append(bar)
+                self._finalize_bar(bar)
+
+            bars_list = list(self.bars)
+            if bars_list:
+                self.session_open = bars_list[0]["o"]
+                # Recompute opening range (9:15–9:30 IST = 9h15m–9h30m)
+                for bar in bars_list:
+                    try:
+                        bt = datetime.strptime(bar["t"], "%Y-%m-%dT%H:%M")
+                        elapsed = (bt.hour - 9) * 60 + (bt.minute - 15)
+                        if 0 <= elapsed < _OR_END_MIN:
+                            self.or_high = max(self.or_high or bar["h"], bar["h"])
+                            self.or_low  = min(self.or_low  or bar["l"], bar["l"])
+                    except Exception:
+                        pass
+
+            logger.info("[Realtime] %s bootstrapped %d bars from yfinance "
+                        "(prev_day H=%.2f L=%.2f C=%.2f)",
+                        self.symbol, len(self.bars),
+                        self.prev_day_high or 0,
+                        self.prev_day_low  or 0,
+                        self.prev_day_close or 0)
+
+        except Exception as exc:
+            logger.warning("[Realtime] %s yfinance bootstrap failed: %s", self.symbol, exc)
+
     def tick(self, ltp: float, ohlc: dict | None, volume: int, ts: datetime) -> None:
         """Process a new quote tick."""
         minute_key = ts.strftime("%Y-%m-%dT%H:%M")
@@ -327,10 +397,14 @@ class KotakRealtimeCollector:
     def update_symbols(self, symbols: list[str]) -> None:
         """Called by trade engine when daily stock list changes."""
         self._symbols = symbols
-        # Create trackers for new symbols
         for sym in symbols:
             if sym not in self._trackers:
-                self._trackers[sym] = SymbolTracker(sym)
+                tracker = SymbolTracker(sym)
+                # Bootstrap with yfinance if no live data yet
+                if len(tracker.bars) < 30:
+                    tracker.bootstrap_yfinance()
+                    tracker.save()
+                self._trackers[sym] = tracker
 
     def _poll_once(self) -> None:
         """One polling cycle: fetch quotes for all symbols and update bars."""
@@ -347,12 +421,18 @@ class KotakRealtimeCollector:
                     continue
 
                 q = quote_list[0] if isinstance(quote_list, list) else quote_list
-                ltp    = float(q.get("ltp") or q.get("last_price") or q.get("lastPrice") or 0)
-                volume = int(q.get("totalVolume") or q.get("volume") or q.get("Volume") or 0)
-                ohlc   = {
-                    "open":  float(q.get("open") or ltp),
-                    "high":  float(q.get("dayHigh") or q.get("high") or ltp),
-                    "low":   float(q.get("dayLow") or q.get("low") or ltp),
+                ltp = float(q.get("ltp") or q.get("last_price") or q.get("lastPrice") or 0)
+                # Kotak Neo API: volume is "last_volume" (cumulative day volume)
+                volume = int(
+                    q.get("last_volume") or q.get("totalVolume")
+                    or q.get("volume") or q.get("Volume") or 0
+                )
+                # Kotak Neo API: OHLC is a nested dict under "ohlc" key
+                nested_ohlc = q.get("ohlc") or {}
+                ohlc = {
+                    "open": float(nested_ohlc.get("open") or q.get("open") or ltp),
+                    "high": float(nested_ohlc.get("high") or q.get("dayHigh") or q.get("high") or ltp),
+                    "low":  float(nested_ohlc.get("low")  or q.get("dayLow")  or q.get("low")  or ltp),
                 }
 
                 if ltp <= 0:
@@ -378,7 +458,13 @@ class KotakRealtimeCollector:
 
     def start(self, symbols: list[str] | None = None) -> None:
         if symbols:
-            self.update_symbols(symbols)
+            self._symbols = symbols
+        # Bootstrap all symbols with yfinance before starting live polling
+        for sym in self._symbols:
+            tracker = self._trackers.setdefault(sym, SymbolTracker(sym))
+            if len(tracker.bars) < 30:
+                tracker.bootstrap_yfinance()
+                tracker.save()
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
