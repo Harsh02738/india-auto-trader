@@ -277,6 +277,15 @@ class SymbolTracker:
         if not bars:
             return {}
 
+        # Deduplicate and sort by timestamp (prevents lightweight-charts assertion errors)
+        seen: set[str] = set()
+        deduped = []
+        for b in sorted(bars, key=lambda x: x["t"]):
+            if b["t"] not in seen:
+                seen.add(b["t"])
+                deduped.append(b)
+        bars = deduped
+
         last    = bars[-1]
         closes  = [b["c"] for b in bars]
         last_close = closes[-1]

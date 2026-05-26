@@ -50,7 +50,15 @@ async def get_intraday(symbol: str, bars: int = 390):
             })
         data = parsed
 
-    return data[-bars:]
+    # Deduplicate by timestamp and sort ascending (lightweight-charts requires this)
+    seen_ts: set[int] = set()
+    clean = []
+    for b in sorted(data, key=lambda x: x["time"]):
+        if b["time"] not in seen_ts:
+            seen_ts.add(b["time"])
+            clean.append(b)
+
+    return clean[-bars:]
 
 
 @router.get("")
