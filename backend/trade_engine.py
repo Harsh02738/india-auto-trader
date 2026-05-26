@@ -163,16 +163,42 @@ def _maybe_pick_stocks() -> None:
             _daily_stocks = load_today_stocks()
 
 
-def _get_scan_symbols() -> list[str]:
-    """Return today's stocks, or fallback universe."""
-    if _daily_stocks:
-        return _daily_stocks
-    # Pre-10 AM: load whatever we have
+_EXTRA_SYMBOLS = Path("data/portfolio/extra_symbols.json")
+
+
+def _get_extra_symbols() -> list[str]:
+    """Return any symbols added via Telegram /analyze command today."""
     try:
-        from daily_stock_picker import load_today_stocks
-        return load_today_stocks()
+        if not _EXTRA_SYMBOLS.exists():
+            return []
+        data = json.loads(_EXTRA_SYMBOLS.read_text())
+        today = _ist_now().strftime("%Y-%m-%d")
+        if data.get("date") != today:
+            return []
+        return data.get("symbols", [])
     except Exception:
-        return ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS"]
+        return []
+
+
+def _get_scan_symbols() -> list[str]:
+    """Return today's stocks + any user-added symbols, or fallback universe."""
+    base = _daily_stocks
+    if not base:
+        try:
+            from daily_stock_picker import load_today_stocks
+            base = load_today_stocks()
+        except Exception:
+            base = ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS"]
+
+    # Merge user-added symbols (no duplicates, preserve order)
+    extra = _get_extra_symbols()
+    seen = set(base)
+    merged = list(base)
+    for sym in extra:
+        if sym not in seen:
+            merged.append(sym)
+            seen.add(sym)
+    return merged
 
 
 # ── Loop 1: Market Scan (autonomous execution) ─────────────────────────────────

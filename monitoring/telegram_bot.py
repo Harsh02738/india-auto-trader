@@ -37,8 +37,9 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-PAUSE_FLAG = Path("data/portfolio/trading_paused.flag")
-SNAPSHOT_FILE = Path("data/portfolio/snapshot.json")
+PAUSE_FLAG      = Path("data/portfolio/trading_paused.flag")
+SNAPSHOT_FILE   = Path("data/portfolio/snapshot.json")
+EXTRA_SYMBOLS   = Path("data/portfolio/extra_symbols.json")  # user-added via Telegram
 
 # ── Shared state ───────────────────────────────────────────────────────────────
 _loop: asyncio.AbstractEventLoop | None = None
@@ -117,7 +118,7 @@ def send_analysis_card(consensus) -> None:
     asyncio.run_coroutine_threadsafe(_send_analysis_card_coro(consensus), _loop)
 
 
-async def _send_analysis_card_coro(consensus) -> None:
+async def _send_analysis_card_coro(consensus, universe_added: bool = False) -> None:
     """Format and send the rich analysis card (info only — trades execute autonomously)."""
     chat_id = settings.telegram_chat_id
     if not chat_id or not _bot:
@@ -518,11 +519,54 @@ async def _handle_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
+# ── Universe management ────────────────────────────────────────────────────────
+
+def _add_to_universe(symbol: str) -> bool:
+    """
+    Add symbol to today's extra watchlist (data/portfolio/extra_symbols.json).
+    Trade engine reads this file on every scan cycle. Returns True if newly added.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    EXTRA_SYMBOLS.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(EXTRA_SYMBOLS.read_text()) if EXTRA_SYMBOLS.exists() else {}
+    except Exception:
+        data = {}
+
+    # Reset if stale from a previous day
+    if data.get("date") != today:
+        data = {"date": today, "symbols": []}
+
+    if symbol in data["symbols"]:
+        return False  # already tracked
+
+    data["symbols"].append(symbol)
+    EXTRA_SYMBOLS.write_text(json.dumps(data, indent=2))
+    logger.info("[Telegram] Added %s to extra universe", symbol)
+
+    # Bootstrap realtime data for this symbol immediately
+    try:
+        from data_collector.kotak_realtime import SymbolTracker, MARKET_DIR
+        market_file = MARKET_DIR / f"{symbol}_ohlcv.json"
+        if not market_file.exists() or len(
+            json.loads(market_file.read_text()).get("candles", [])
+        ) < 30:
+            tracker = SymbolTracker(symbol)
+            tracker.bootstrap_yfinance()
+            tracker.save()
+            logger.info("[Telegram] Bootstrapped realtime data for %s", symbol)
+    except Exception as exc:
+        logger.debug("[Telegram] Bootstrap for %s failed: %s", symbol, exc)
+
+    return True
+
+
 # ── Analysis runner ────────────────────────────────────────────────────────────
 
 async def _run_analysis(update: Update, symbol: str) -> None:
-    """Fetch data, run strategy engine, send analysis card."""
+    """Fetch data, run strategy engine, send analysis card, add to universe."""
     await update.message.reply_text(f"⏳ Analysing <b>{symbol}</b>…", parse_mode="HTML")
+
     try:
         ohlcv, fundamentals = await asyncio.get_event_loop().run_in_executor(
             None, _fetch_data, symbol
@@ -544,27 +588,46 @@ async def _run_analysis(update: Update, symbol: str) -> None:
         await update.message.reply_text(f"❌ Analysis error: {exc}")
         return
 
-    await _send_analysis_card_coro(consensus)
+    # Always add to universe so the engine monitors it going forward
+    newly_added = await asyncio.get_event_loop().run_in_executor(
+        None, _add_to_universe, symbol
+    )
+
+    # Send analysis card (modified to mention universe status)
+    await _send_analysis_card_coro(consensus, universe_added=newly_added)
+
+    if newly_added:
+        await update.message.reply_text(
+            f"📋 <b>{symbol}</b> added to today's scan universe.\n"
+            "The engine will monitor it every 2 minutes for the rest of the session.",
+            parse_mode="HTML",
+        )
 
 
 def _fetch_data(symbol: str) -> tuple[dict, dict | None]:
-    """Blocking: fetch OHLCV and fundamentals (called in executor)."""
-    from data_collector.market_data import collect_daily
-    from pathlib import Path
-    import json
-
+    """Blocking: fetch OHLCV (intraday 1-min, 150+ bars) and fundamentals."""
     ohlcv = {}
-    # Try cached file first to avoid rate limits
+
+    # Use cached realtime file if it has enough bars
     cache_path = Path(f"data/market/{symbol}_ohlcv.json")
     if cache_path.exists():
         try:
-            ohlcv = json.loads(cache_path.read_text())
+            cached = json.loads(cache_path.read_text())
+            if len(cached.get("candles", [])) >= 30:
+                ohlcv = cached
         except Exception:
             pass
 
-    # Refresh from yfinance if stale or missing
+    # Bootstrap from yfinance if cache is missing or thin
     if not ohlcv:
-        ohlcv = collect_daily(symbol)
+        try:
+            from data_collector.kotak_realtime import SymbolTracker
+            tracker = SymbolTracker(symbol)
+            tracker.bootstrap_yfinance()
+            tracker.save()
+            ohlcv = tracker.to_ohlcv_payload()
+        except Exception as exc:
+            logger.debug("yfinance bootstrap failed for %s: %s", symbol, exc)
 
     fundamentals = None
     fund_path = Path(f"data/fundamentals/{symbol}_fund.json")
